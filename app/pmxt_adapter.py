@@ -105,16 +105,29 @@ class PMXTAdapter:
             )
 
         ticker = lookup["lookup_value"]
+        # Kalshi URLs like /markets/{series}/{event}/{ticker} often represent an event family.
+        # Prefer event fetch to get the full candidate/contract stack; fallback to single market.
+        try:
+            event = self.kalshi.fetch_event(slug=ticker)
+            return {
+                "entity_type": "event",
+                "lookup": lookup,
+                "event": _normalize_event(event),
+            }
+        except Exception:
+            pass
+
         try:
             market = self.kalshi.fetch_market(slug=ticker)
+            return {
+                "entity_type": "market",
+                "lookup": lookup,
+                "market": _normalize_market(market),
+            }
         except Exception as exc:  # pragma: no cover - network/runtime path
-            raise PMXTAdapterError(f"Kalshi fetch failed for ticker '{ticker}': {exc}") from exc
-
-        return {
-            "entity_type": "market",
-            "lookup": lookup,
-            "market": _normalize_market(market),
-        }
+            raise PMXTAdapterError(
+                f"Kalshi fetch failed for ticker/event '{ticker}': {exc}"
+            ) from exc
 
     def _fetch_polymarket(self, lookup: dict[str, str]) -> dict[str, Any]:
         if lookup.get("lookup_type") != "event_slug":

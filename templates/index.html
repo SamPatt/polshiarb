@@ -4,19 +4,28 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ page_title }}</title>
-    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
     <style>
+      :root {
+        color-scheme: dark;
+      }
       body {
         font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
-        max-width: 880px;
+        background: radial-gradient(circle at top, #1a2230 0%, #0b1018 42%, #070b12 100%);
+        color: #e6edf3;
+        max-width: 1280px;
         margin: 2rem auto;
-        padding: 0 1rem;
+        padding: 0 1rem 2rem;
         line-height: 1.4;
       }
+      a {
+        color: #7cc7ff;
+      }
       .card {
-        border: 1px solid #ccc;
-        border-radius: 8px;
+        border: 1px solid #263343;
+        border-radius: 10px;
         padding: 1rem;
+        background: #121a24;
+        box-shadow: 0 10px 24px rgba(0, 0, 0, 0.25);
       }
       label {
         display: block;
@@ -24,35 +33,738 @@
       }
       input[type="url"] {
         width: 100%;
-        padding: 0.5rem;
+        padding: 0.55rem;
         margin-top: 0.25rem;
+        background: #0c121a;
+        border: 1px solid #2f4257;
+        border-radius: 8px;
+        color: #e6edf3;
+      }
+      input[type="url"]:focus {
+        outline: 2px solid #5fa8ff;
+        outline-offset: 1px;
       }
       button {
         margin-top: 1rem;
-        padding: 0.6rem 1rem;
+        padding: 0.58rem 0.9rem;
+        cursor: pointer;
+        border-radius: 8px;
+        border: 1px solid #36506a;
+        background: #1b2f42;
+        color: #f7fbff;
+      }
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.5;
+      }
+      .button-ghost {
+        background: #111a25;
+        border-color: #2f3d4d;
+      }
+      .button-danger {
+        background: #3f1d24;
+        border-color: #703340;
       }
       .muted {
-        color: #555;
+        color: #8fa6be;
+      }
+      .status {
+        margin-top: 0.75rem;
+        min-height: 1.2rem;
+      }
+      .error {
+        color: #ff7d8c;
+      }
+      .ok {
+        color: #7ce2a6;
+      }
+      .grid {
+        margin-top: 1.5rem;
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1rem;
+      }
+      .block-title {
+        margin: 0;
+      }
+      .side-subtitle {
+        margin: 0.4rem 0 0.8rem;
+        color: #8fa6be;
+      }
+      .stack {
+        display: grid;
+        gap: 0.8rem;
+      }
+      .market-card {
+        border: 1px solid #33475d;
+        border-radius: 8px;
+        padding: 0.75rem;
+        background: #0f1621;
+      }
+      .market-card h4 {
+        margin: 0;
+        font-size: 1rem;
+      }
+      .meta {
+        margin: 0.45rem 0;
+        color: #9eb2c7;
+        font-size: 0.93rem;
+      }
+      .resolution {
+        margin: 0.55rem 0;
+        color: #d0deeb;
+        font-size: 0.92rem;
+      }
+      .pill-wrap {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.35rem;
+        margin-top: 0.45rem;
+      }
+      .pill {
+        border: 1px solid #3f5872;
+        border-radius: 999px;
+        padding: 0.1rem 0.48rem;
+        font-size: 0.81rem;
+        background: #1a2634;
+        color: #dce8f5;
+      }
+      .pill.interactive {
+        cursor: pointer;
+        transition: border-color 120ms ease, background 120ms ease;
+      }
+      .pill.interactive:hover {
+        border-color: #77b9ff;
+        background: #243447;
+      }
+      .pill.search-hit {
+        border-color: #f8ca5e;
+        background: #4e3c14;
+      }
+      .pill.source-pill {
+        border-color: #84d2ff;
+        background: #12344f;
+      }
+      .card-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.45rem;
+        margin-top: 0.72rem;
+      }
+      .market-card.dimmed {
+        opacity: 0.45;
+        border-color: #253242;
+      }
+      .market-card.selected {
+        border-color: #7fcbff;
+        box-shadow: 0 0 0 1px rgba(127, 203, 255, 0.35) inset;
+      }
+      .market-card.matched {
+        border-color: var(--match-color, #7ce2a6);
+        box-shadow: 0 0 0 1px color-mix(in srgb, var(--match-color) 50%, transparent) inset;
+      }
+      .market-card.search-hit {
+        border-color: #f8ca5e;
+        box-shadow: 0 0 0 1px rgba(248, 202, 94, 0.45) inset;
+      }
+      .hidden {
+        display: none;
+      }
+      @media (max-width: 980px) {
+        .grid {
+          grid-template-columns: 1fr;
+        }
       }
     </style>
   </head>
   <body>
     <h1>{{ page_title }}</h1>
     <p class="muted">
-      Phase 1 skeleton is running. URL parsing, market fetching, and pair mapping will be added in next phases.
+      Paste one Kalshi URL and one Polymarket URL to preview market/event options and match them directly in the UI.
     </p>
 
     <section class="card">
-      <h2>Add Pair (Preview)</h2>
-      <form>
+      <h2 style="margin-top: 0;">Add Pair (Preview + Matching)</h2>
+      <form id="preview-form">
         <label for="kalshi_url">Kalshi URL</label>
-        <input id="kalshi_url" name="kalshi_url" type="url" placeholder="https://kalshi.com/markets/...">
+        <input
+          id="kalshi_url"
+          name="kalshi_url"
+          type="url"
+          required
+          placeholder="https://kalshi.com/markets/..."
+          value="https://kalshi.com/markets/kxsenateild/ild/kxsenateild-26"
+        >
 
         <label for="pm_url">Polymarket URL</label>
-        <input id="pm_url" name="pm_url" type="url" placeholder="https://polymarket.com/event/...">
+        <input
+          id="pm_url"
+          name="pm_url"
+          type="url"
+          required
+          placeholder="https://polymarket.com/event/..."
+          value="https://polymarket.com/event/illinois-democratic-senate-primary-winner"
+        >
 
-        <button type="button" disabled>Load Pair (Phase 2)</button>
+        <button id="preview-submit" type="submit">Load Pair Preview</button>
+        <div id="preview-status" class="status muted"></div>
       </form>
     </section>
+
+    <section id="preview-results" class="grid hidden">
+      <article class="card">
+        <h3 class="block-title">Kalshi</h3>
+        <p class="side-subtitle">Left-side options</p>
+        <div id="kalshi-stack" class="stack"></div>
+      </article>
+      <article class="card">
+        <h3 class="block-title">Polymarket</h3>
+        <p class="side-subtitle">Right-side options</p>
+        <div id="polymarket-stack" class="stack"></div>
+      </article>
+    </section>
+
+    <script>
+      const form = document.getElementById("preview-form");
+      const submitButton = document.getElementById("preview-submit");
+      const statusEl = document.getElementById("preview-status");
+      const resultsEl = document.getElementById("preview-results");
+      const kalshiStack = document.getElementById("kalshi-stack");
+      const polymarketStack = document.getElementById("polymarket-stack");
+      const kalshiInput = document.getElementById("kalshi_url");
+      const polymarketInput = document.getElementById("pm_url");
+
+      const state = {
+        cards: {
+          kalshi: [],
+          polymarket: [],
+        },
+        pending: null,
+        pairCounter: 1,
+        colorIndex: 0,
+        highlight: null,
+      };
+
+      const colorPalette = [
+        "#2dd4bf",
+        "#60a5fa",
+        "#f59e0b",
+        "#f472b6",
+        "#34d399",
+        "#a78bfa",
+        "#fb7185",
+        "#22d3ee",
+      ];
+
+      const setStatus = (message, kind = "muted") => {
+        statusEl.textContent = message;
+        statusEl.className = `status ${kind}`;
+      };
+
+      const nextMatchColor = () => {
+        const color = colorPalette[state.colorIndex % colorPalette.length];
+        state.colorIndex += 1;
+        return color;
+      };
+
+      const getCard = (side, cardId) => state.cards[side].find((card) => card.id === cardId);
+
+      const getCardByPair = (pairId) => {
+        for (const side of ["kalshi", "polymarket"]) {
+          const found = state.cards[side].find((card) => card.matchedPairId === pairId);
+          if (found) {
+            return found;
+          }
+        }
+        return null;
+      };
+
+      const resetMatchingState = () => {
+        state.pending = null;
+        state.pairCounter = 1;
+        state.colorIndex = 0;
+      };
+
+      const createCard = (side, market, index) => {
+        const marketId = market.market_id || `${side}-market-${index}`;
+        const yesLabel = market?.yes?.label || "";
+        const noLabel = market?.no?.label || "";
+        const yesPrice = typeof market?.yes?.price === "number" ? market.yes.price : null;
+        const noPrice = typeof market?.no?.price === "number" ? market.no.price : null;
+        return {
+          id: `${side}-${marketId}-${index}`,
+          side,
+          marketId,
+          title: market.title || marketId,
+          url: market.url || "",
+          resolutionRules: market.resolution_rules || market.description || "",
+          outcomes: market.outcomes || [],
+          yesLabel,
+          noLabel,
+          yesPrice,
+          noPrice,
+          dismissed: false,
+          matchedPairId: null,
+          matchColor: null,
+        };
+      };
+
+      const loadCardsFromPreview = (preview) => {
+        const kalshiMarkets = preview?.kalshi?.event?.markets || [];
+        const kalshiMarket = preview?.kalshi?.market;
+        const polymarketMarkets = preview?.polymarket?.event?.markets || [];
+
+        if (kalshiMarkets.length) {
+          state.cards.kalshi = kalshiMarkets.map((market, index) =>
+            createCard("kalshi", market, index)
+          );
+        } else {
+          state.cards.kalshi = kalshiMarket ? [createCard("kalshi", kalshiMarket, 0)] : [];
+        }
+        state.cards.polymarket = polymarketMarkets.map((market, index) =>
+          createCard("polymarket", market, index)
+        );
+        resetMatchingState();
+      };
+
+      const clearStacks = () => {
+        kalshiStack.textContent = "";
+        polymarketStack.textContent = "";
+      };
+
+      const normalizeText = (value) => (value || "").toString().trim().toLowerCase();
+
+      const normalizePillLabel = (label) =>
+        normalizeText(label).replace(/\s+/g, " ").replace(/^not\s+/, "").trim();
+
+      const oppositeSide = (side) => (side === "kalshi" ? "polymarket" : "kalshi");
+
+      const getPillPolarity = (card, label) => {
+        const normalized = normalizeText(label);
+        if (!normalized) {
+          return null;
+        }
+        if (normalizeText(card.yesLabel) === normalized) {
+          return "yes";
+        }
+        if (normalizeText(card.noLabel) === normalized) {
+          return "no";
+        }
+        return null;
+      };
+
+      const cardMatchesHighlight = (card, highlight) => {
+        if (!highlight || card.dismissed) {
+          return false;
+        }
+        if (highlight.side === card.side && highlight.cardId === card.id) {
+          return false;
+        }
+        if (card.side !== oppositeSide(highlight.side)) {
+          return false;
+        }
+
+        const text = highlight.normalizedText;
+        if (!text) {
+          return false;
+        }
+
+        const title = normalizeText(card.title);
+        const yesLabel = normalizeText(card.yesLabel);
+        const noLabel = normalizeText(card.noLabel);
+
+        if (highlight.polarity === "yes") {
+          if (text === "yes") {
+            return true;
+          }
+          return (
+            yesLabel.includes(text) ||
+            text.includes(yesLabel) ||
+            title.includes(text) ||
+            text.includes(title)
+          );
+        }
+        if (highlight.polarity === "no") {
+          if (text === "no") {
+            return true;
+          }
+          return (
+            noLabel.includes(text) ||
+            text.includes(noLabel) ||
+            title.includes(text) ||
+            text.includes(title)
+          );
+        }
+
+        return (
+          yesLabel.includes(text) ||
+          noLabel.includes(text) ||
+          title.includes(text) ||
+          text.includes(yesLabel) ||
+          text.includes(noLabel) ||
+          text.includes(title)
+        );
+      };
+
+      const findHighlightTargets = (highlight) => {
+        if (!highlight) {
+          return [];
+        }
+        const targetSide = oppositeSide(highlight.side);
+        return state.cards[targetSide]
+          .filter((card) => cardMatchesHighlight(card, highlight))
+          .map((card) => ({ side: card.side, cardId: card.id }));
+      };
+
+      const clearHighlight = () => {
+        state.highlight = null;
+      };
+
+      const handlePillClick = (side, cardId, label, polarity) => {
+        const normalizedLabel = normalizePillLabel(label);
+        if (!normalizedLabel) {
+          return;
+        }
+
+        const sameAsCurrent =
+          state.highlight &&
+          state.highlight.side === side &&
+          state.highlight.cardId === cardId &&
+          state.highlight.normalizedText === normalizedLabel &&
+          state.highlight.polarity === polarity;
+
+        if (sameAsCurrent) {
+          clearHighlight();
+          renderStacks();
+          setStatus("Pill highlight cleared.", "muted");
+          return;
+        }
+
+        state.highlight = {
+          side,
+          cardId,
+          normalizedText: normalizedLabel,
+          polarity: polarity || null,
+        };
+        const targets = findHighlightTargets(state.highlight);
+        renderStacks();
+        if (targets.length) {
+          scrollToCard(targets[0].side, targets[0].cardId);
+          setStatus(`Found ${targets.length} opposite-side match(es) for "${label}".`, "ok");
+        } else {
+          setStatus(`No opposite-side match found for "${label}".`, "muted");
+        }
+      };
+
+      const isOutcomeHighlighted = (side, card, outcome) => {
+        if (!state.highlight) {
+          return false;
+        }
+        if (state.highlight.side === side && state.highlight.cardId === card.id) {
+          return normalizePillLabel(outcome.label) === state.highlight.normalizedText;
+        }
+        if (side !== oppositeSide(state.highlight.side)) {
+          return false;
+        }
+
+        const polarity = getPillPolarity(card, outcome.label);
+        if (state.highlight.polarity && polarity !== state.highlight.polarity) {
+          return false;
+        }
+
+        const sourceText = state.highlight.normalizedText;
+        const text = normalizePillLabel(outcome.label);
+        if (sourceText === "yes" || sourceText === "no") {
+          return !!polarity;
+        }
+        return text.includes(sourceText) || sourceText.includes(text);
+      };
+
+      const createOutcomePills = (side, card, outcomes) => {
+        const wrap = document.createElement("div");
+        wrap.className = "pill-wrap";
+        outcomes.forEach((outcome) => {
+          const pill = document.createElement("button");
+          pill.type = "button";
+          pill.className = "pill interactive";
+          const label = outcome.label || "(unlabeled)";
+          const price = typeof outcome.price === "number" ? ` @ ${outcome.price}` : "";
+          pill.textContent = `${label}${price}`;
+          const polarity = getPillPolarity(card, label);
+          if (isOutcomeHighlighted(side, card, outcome)) {
+            pill.classList.add("search-hit");
+          }
+          if (
+            state.highlight &&
+            state.highlight.side === side &&
+            state.highlight.cardId === card.id &&
+            normalizePillLabel(label) === state.highlight.normalizedText
+          ) {
+            pill.classList.add("source-pill");
+          }
+          pill.addEventListener("click", () => handlePillClick(side, card.id, label, polarity));
+          wrap.appendChild(pill);
+        });
+        if (!outcomes.length) {
+          const pill = document.createElement("span");
+          pill.className = "pill";
+          pill.textContent = "No outcomes";
+          wrap.appendChild(pill);
+        }
+        return wrap;
+      };
+
+      const unmatchPair = (pairId, quiet = false) => {
+        if (!pairId) {
+          return;
+        }
+        for (const side of ["kalshi", "polymarket"]) {
+          state.cards[side].forEach((card) => {
+            if (card.matchedPairId === pairId) {
+              card.matchedPairId = null;
+              card.matchColor = null;
+            }
+          });
+        }
+        if (!quiet) {
+          setStatus("Match removed.", "muted");
+        }
+      };
+
+      const dismissCard = (side, cardId) => {
+        const card = getCard(side, cardId);
+        if (!card) {
+          return;
+        }
+        if (card.matchedPairId) {
+          unmatchPair(card.matchedPairId, true);
+        }
+        card.dismissed = true;
+        if (state.pending && state.pending.side === side && state.pending.cardId === cardId) {
+          state.pending = null;
+        }
+        clearHighlight();
+        renderStacks();
+        setStatus("Card dismissed.", "muted");
+      };
+
+      const linkCards = (first, second) => {
+        const pairId = `pair-${state.pairCounter}`;
+        state.pairCounter += 1;
+        const color = nextMatchColor();
+        first.matchedPairId = pairId;
+        second.matchedPairId = pairId;
+        first.matchColor = color;
+        second.matchColor = color;
+      };
+
+      const beginOrCompleteMatch = (side, cardId) => {
+        const card = getCard(side, cardId);
+        if (!card || card.dismissed || card.matchedPairId) {
+          return;
+        }
+
+        if (!state.pending) {
+          clearHighlight();
+          state.pending = { side, cardId };
+          renderStacks();
+          setStatus(
+            `Selected ${card.title}. Choose one ${side === "kalshi" ? "Polymarket" : "Kalshi"} card to complete the match.`,
+            "ok"
+          );
+          return;
+        }
+
+        if (state.pending.side === side) {
+          if (state.pending.cardId === cardId) {
+            state.pending = null;
+            renderStacks();
+            setStatus("Selection cleared.", "muted");
+          }
+          return;
+        }
+
+        const first = getCard(state.pending.side, state.pending.cardId);
+        if (!first || first.dismissed || first.matchedPairId) {
+          state.pending = null;
+          renderStacks();
+          setStatus("Prior selection is no longer available.", "error");
+          return;
+        }
+
+        linkCards(first, card);
+        state.pending = null;
+        clearHighlight();
+        renderStacks();
+        setStatus("Cards matched.", "ok");
+      };
+
+      const isCardHighlightTarget = (card) => cardMatchesHighlight(card, state.highlight);
+
+      const scrollToCard = (side, cardId) => {
+        const selector = `[data-side="${side}"][data-card-id="${cardId}"]`;
+        const el = document.querySelector(selector);
+        if (el) {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+      };
+
+      const createMarketCardElement = (side, card) => {
+        const cardEl = document.createElement("div");
+        cardEl.className = "market-card";
+        cardEl.dataset.side = side;
+        cardEl.dataset.cardId = card.id;
+
+        const isPendingThis =
+          state.pending && state.pending.side === side && state.pending.cardId === card.id;
+        const isPendingSameSideOther =
+          state.pending &&
+          state.pending.side === side &&
+          state.pending.cardId !== card.id &&
+          !card.matchedPairId;
+
+        if (isPendingThis) {
+          cardEl.classList.add("selected");
+        }
+        if (isPendingSameSideOther) {
+          cardEl.classList.add("dimmed");
+        }
+        if (card.matchedPairId) {
+          cardEl.classList.add("matched");
+          cardEl.style.setProperty("--match-color", card.matchColor || "#7ce2a6");
+        }
+        if (isCardHighlightTarget(card)) {
+          cardEl.classList.add("search-hit");
+        }
+
+        const title = document.createElement("h4");
+        title.textContent = card.title;
+        cardEl.appendChild(title);
+
+        const idMeta = document.createElement("p");
+        idMeta.className = "meta";
+        const yesPriceText = typeof card.yesPrice === "number" ? card.yesPrice.toFixed(3) : "n/a";
+        idMeta.textContent = `market_id: ${card.marketId} | YES price: ${yesPriceText}`;
+        cardEl.appendChild(idMeta);
+
+        if (card.url) {
+          const link = document.createElement("a");
+          link.href = card.url;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.textContent = card.url;
+          cardEl.appendChild(link);
+        }
+
+        const rules = document.createElement("p");
+        rules.className = "resolution";
+        rules.textContent = `Resolution rules: ${card.resolutionRules || "n/a"}`;
+        cardEl.appendChild(rules);
+
+        cardEl.appendChild(createOutcomePills(side, card, card.outcomes));
+
+        const actions = document.createElement("div");
+        actions.className = "card-actions";
+
+        const dismissBtn = document.createElement("button");
+        dismissBtn.type = "button";
+        dismissBtn.className = "button-ghost";
+        dismissBtn.textContent = "Dismiss";
+        dismissBtn.disabled = !!card.matchedPairId;
+        dismissBtn.addEventListener("click", () => dismissCard(side, card.id));
+        actions.appendChild(dismissBtn);
+
+        if (card.matchedPairId) {
+          const unmatchBtn = document.createElement("button");
+          unmatchBtn.type = "button";
+          unmatchBtn.className = "button-danger";
+          unmatchBtn.textContent = "Unmatch";
+          unmatchBtn.addEventListener("click", () => {
+            unmatchPair(card.matchedPairId);
+            clearHighlight();
+            renderStacks();
+          });
+          actions.appendChild(unmatchBtn);
+        } else {
+          const matchBtn = document.createElement("button");
+          matchBtn.type = "button";
+          matchBtn.textContent = isPendingThis ? "Selected" : "Match";
+          matchBtn.disabled = !!isPendingSameSideOther;
+          matchBtn.addEventListener("click", () => beginOrCompleteMatch(side, card.id));
+          actions.appendChild(matchBtn);
+        }
+
+        cardEl.appendChild(actions);
+        return cardEl;
+      };
+
+      const renderSideStack = (side, container) => {
+        const visibleCards = state.cards[side]
+          .filter((card) => !card.dismissed)
+          .sort((a, b) => {
+            const aPrice = typeof a.yesPrice === "number" ? a.yesPrice : -1;
+            const bPrice = typeof b.yesPrice === "number" ? b.yesPrice : -1;
+            if (bPrice !== aPrice) {
+              return bPrice - aPrice;
+            }
+            return a.title.localeCompare(b.title);
+          });
+        if (!visibleCards.length) {
+          const empty = document.createElement("p");
+          empty.className = "muted";
+          empty.textContent = "No visible cards.";
+          container.appendChild(empty);
+          return;
+        }
+        visibleCards.forEach((card) => {
+          container.appendChild(createMarketCardElement(side, card));
+        });
+      };
+
+      const renderStacks = () => {
+        clearStacks();
+        renderSideStack("kalshi", kalshiStack);
+        renderSideStack("polymarket", polymarketStack);
+      };
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        submitButton.disabled = true;
+        resultsEl.classList.add("hidden");
+        setStatus("Loading preview...", "muted");
+
+        const kalshi_url = kalshiInput.value.trim();
+        const polymarket_url = polymarketInput.value.trim();
+
+        try {
+          const response = await fetch("/api/preview", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ kalshi_url, polymarket_url }),
+          });
+          const payload = await response.json();
+          if (!payload.ok) {
+            setStatus(payload.error || "Preview failed.", "error");
+            return;
+          }
+
+          loadCardsFromPreview(payload.preview);
+          clearHighlight();
+          renderStacks();
+          resultsEl.classList.remove("hidden");
+          setStatus("Preview loaded. Cards are sorted by YES price.", "ok");
+        } catch (error) {
+          setStatus(`Request failed: ${error}`, "error");
+        } finally {
+          submitButton.disabled = false;
+        }
+      });
+
+      window.addEventListener("DOMContentLoaded", () => {
+        if (kalshiInput.value.trim() && polymarketInput.value.trim()) {
+          form.requestSubmit();
+        }
+      });
+    </script>
   </body>
 </html>

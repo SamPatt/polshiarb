@@ -4,6 +4,44 @@ from app.pmxt_adapter import PMXTAdapter
 
 
 class FakeKalshiClient:
+    def fetch_event(self, slug: str) -> dict:
+        assert slug == "kxsenateild-26"
+        return {
+            "id": "kalshi-event-1",
+            "slug": slug,
+            "title": "Illinois Democratic Senate nominee?",
+            "description": "Resolves to the candidate who wins the nomination.",
+            "url": "https://kalshi.com/events/KXSENATEILD-26",
+            "markets": [
+                {
+                    "market_id": "KXSENATEILD-26-DDUR",
+                    "title": "Illinois Democratic Senate nominee?",
+                    "description": "Resolves YES if Dick Durbin wins nomination.",
+                    "resolution_date": "2026-03-17",
+                    "url": "https://kalshi.com/events/KXSENATEILD-26",
+                    "outcomes": [
+                        {"outcome_id": "DDUR", "label": "Dick Durbin", "price": 0.01, "market_id": "KXSENATEILD-26-DDUR"},
+                        {"outcome_id": "NOT-DDUR", "label": "Not Dick Durbin", "price": 0.99, "market_id": "KXSENATEILD-26-DDUR"},
+                    ],
+                    "yes": {"outcome_id": "DDUR", "label": "Dick Durbin", "price": 0.01, "market_id": "KXSENATEILD-26-DDUR"},
+                    "no": {"outcome_id": "NOT-DDUR", "label": "Not Dick Durbin", "price": 0.99, "market_id": "KXSENATEILD-26-DDUR"},
+                },
+                {
+                    "market_id": "KXSENATEILD-26-RKEL",
+                    "title": "Illinois Democratic Senate nominee?",
+                    "description": "Resolves YES if Robin Kelly wins nomination.",
+                    "resolution_date": "2026-03-17",
+                    "url": "https://kalshi.com/events/KXSENATEILD-26",
+                    "outcomes": [
+                        {"outcome_id": "RKEL", "label": "Robin Kelly", "price": 0.05, "market_id": "KXSENATEILD-26-RKEL"},
+                        {"outcome_id": "NOT-RKEL", "label": "Not Robin Kelly", "price": 0.95, "market_id": "KXSENATEILD-26-RKEL"},
+                    ],
+                    "yes": {"outcome_id": "RKEL", "label": "Robin Kelly", "price": 0.05, "market_id": "KXSENATEILD-26-RKEL"},
+                    "no": {"outcome_id": "NOT-RKEL", "label": "Not Robin Kelly", "price": 0.95, "market_id": "KXSENATEILD-26-RKEL"},
+                },
+            ],
+        }
+
     def fetch_market(self, slug: str) -> dict:
         assert slug == "kxsenateild-26"
         return {
@@ -77,9 +115,13 @@ def test_preview_from_normalized_returns_market_and_event_payloads() -> None:
 
     preview = adapter.preview_from_normalized(normalized)
 
-    assert preview["kalshi"]["entity_type"] == "market"
-    assert preview["kalshi"]["market"]["market_id"] == "kalshi-1"
-    assert preview["kalshi"]["market"]["possible_outcomes"] == ["YES", "NO"]
+    assert preview["kalshi"]["entity_type"] == "event"
+    assert preview["kalshi"]["event"]["event_id"] == "kalshi-event-1"
+    assert len(preview["kalshi"]["event"]["markets"]) == 2
+    assert (
+        preview["kalshi"]["event"]["markets"][0]["possible_outcomes"]
+        == ["Dick Durbin", "Not Dick Durbin"]
+    )
 
     assert preview["polymarket"]["entity_type"] == "event"
     assert preview["polymarket"]["event"]["event_id"] == "poly-event-1"

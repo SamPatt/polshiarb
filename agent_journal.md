@@ -69,3 +69,26 @@ Use this file to keep a running record of what we learn about the repo and excha
   - Marked Phase 3 complete in the implementation plan.
   - Verification: `make test` passed (8 tests) and live `/api/preview` returned `ok=true` with Kalshi market + Polymarket event (32 markets).
   - Open risk: Polymarket event URLs can map to many markets; Phase 4 UI will need explicit market selection/matching UX.
+- 2026-03-04 11:02 EST (phase 4 UI preview wiring)
+  - Updated `templates/index.html` to submit Kalshi/Polymarket URLs to `POST /api/preview` and render side-by-side preview panels.
+  - Added client-side rendering for market/event details and tradable outcomes, with loading/error/success states.
+  - Verification: `make test` still passes (8 tests), page contains preview form/results containers, and live `/api/preview` request returns `ok=true`.
+  - Open risk: large Polymarket events can render many markets at once; Phase 4 follow-up should add market filtering/selection controls.
+- 2026-03-04 11:31 EST (dark mode + interactive matching UI)
+  - Reworked `templates/index.html` to dark theme and added two-column card stacks (Kalshi left, Polymarket right).
+  - Implemented card controls and state logic: dismiss, staged match selection, same-side lockout/grayed cards, pair color linking, and unmatch.
+  - Wired UI to `POST /api/preview` so cards are generated from live PMXT preview payloads.
+  - Marked Phase 4 complete in implementation plan.
+  - Verification: `make test` passes (8 tests), UI HTML includes dark mode and matching controls, and `/api/preview` returns `ok=true`.
+  - Open risk: matching state is currently in-browser only (not persisted yet); persistence/edit flows are covered in Phase 5+.
+- 2026-03-04 11:45 EST (kalshi preview scope correction)
+  - Fixed Kalshi preview fetch to prefer `fetch_event(slug=...)` and fallback to `fetch_market(slug=...)` in `app/pmxt_adapter.py`.
+  - Updated UI card loader to consume `preview.kalshi.event.markets` when available so the full candidate stack renders on the left.
+  - Updated PMXT adapter tests to cover Kalshi event-first behavior.
+  - Verification: `make test` passed (8 tests); live `/api/preview` now returns Kalshi `entity_type=event` with 14 markets for `kxsenateild-26`.
+- 2026-03-04 12:05 EST (yes-price sorting + pill-driven cross-side highlighting)
+  - Updated matching UI to sort visible cards by `YES` price descending on each side.
+  - Added clickable outcome pills with opposite-side text matching/highlighting and smooth scroll-to-first-match behavior.
+  - Added temporary prefilled test URLs for Kalshi/Polymarket inputs and auto-submit on page load for faster iteration.
+  - Verification: `make test` passed (8 tests); page HTML confirms prefilled URLs, auto-load hook, and pill-click logic wiring.
+  - Open risk: pill text matching uses heuristic matching (label/title text + polarity); may need stricter/fuzzier tuning per event type.

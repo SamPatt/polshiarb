@@ -38,7 +38,7 @@
   - market title, description/rules, URL, resolution date, outcomes (`yes/no` and full list), IDs for trading.
 - Deliverable: `/api/preview` endpoint returning both markets in one normalized payload.
 
-5. **Phase 4: Pairing UI (new pair flow)**
+5. **Phase 4: Pairing UI (new pair flow) (Completed on 2026-03-04)**
 - Build "Add Pair" page:
   - Kalshi URL input
   - PM URL input
