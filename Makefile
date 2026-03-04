@@ -3,7 +3,7 @@ PYTHON ?= $(VENV_DIR)/bin/python
 HOST ?= 127.0.0.1
 PORT ?= 8011
 
-.PHONY: setup init-db run-web check-pmxt
+.PHONY: setup init-db run-web test check-pmxt
 
 setup:
 	python3 -m venv $(VENV_DIR)
@@ -15,6 +15,9 @@ init-db:
 
 run-web:
 	$(PYTHON) -m uvicorn app.main:app --host $(HOST) --port $(PORT) --reload
+
+test:
+	$(PYTHON) -m pytest -q
 
 check-pmxt:
 	$(PYTHON) scripts/check_pmxt_health.py

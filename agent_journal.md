@@ -51,3 +51,10 @@ Use this file to keep a running record of what we learn about the repo and excha
   - Updated `README.md` with local setup/run instructions for the Phase 1 skeleton.
   - Added documented command flow: `make setup`, `make init-db`, `make run-web`, `make check-pmxt`.
   - Documented default app URL/health endpoint on port `8011` and a port override example.
+- 2026-03-04 10:08 EST (phase 2 URL parsing + normalization)
+  - Added URL parsing/normalization module `app/url_normalization.py` for Kalshi and Polymarket URLs.
+  - Added API endpoint `POST /api/normalize-pair` in `app/main.py` returning normalized lookup data or validation errors.
+  - Added parser unit tests in `tests/test_url_normalization.py` and `make test` target in `Makefile`.
+  - Added `pytest` to `requirements.txt` and marked Phase 2 completed in the plan file.
+  - Verification: `make test` passed (7 tests). Normalization endpoint returns expected ticker/slug for sample URLs.
+  - Open risk: endpoint currently returns `{ok:false,...}` with HTTP 200 on validation failures; Phase 3 can move this to explicit 4xx response modeling.

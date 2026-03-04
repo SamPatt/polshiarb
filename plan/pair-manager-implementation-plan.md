@@ -22,7 +22,7 @@
 - DB: SQLite initially (easy local), schema ready to move to Postgres later.
 - Deliverable: app boots, DB migration runs, base page loads.
 
-3. **Phase 2: URL parsing + normalization layer**
+3. **Phase 2: URL parsing + normalization layer (Completed on 2026-03-04)**
 - Build parser functions for Kalshi and Polymarket URLs.
 - Extract canonical identifiers (`slug`, `market_id`, or event reference).
 - Return structured parse results and validation errors for malformed URLs.
