@@ -133,3 +133,16 @@ Use this file to keep a running record of what we learn about the repo and excha
   - Marked Phase 7 complete in the implementation plan.
   - Verification: `make test` passed (17 tests).
   - Open risk: monitoring endpoint currently returns a flat list of outcome-link rows; Phase 8 may still want a grouped pair-centric contract depending on downstream consumer preference.
+- 2026-03-04 16:09 EST (phase 8 monitoring-facing API contract)
+  - Refined `GET /api/monitoring/pairs` in `app/main.py` to return a stable pair-centric contract for downstream bots.
+  - Added explicit response models: `MonitoringPair`, `MonitoringMapping`, and `MonitoringLeg`.
+  - Endpoint now returns only monitoring-relevant fields grouped by pair: expiration, recurrence intent, relation type, and exchange-specific market/outcome IDs.
+  - Added endpoint contract tests in `tests/test_monitoring_api_contract.py` to validate default filtering behavior and query-flag behavior.
+  - Documented the monitoring endpoint contract in `README.md` with a concrete JSON example.
+  - Marked Phase 8 complete in the implementation plan.
+  - Verification: `make test` passed (19 tests).
+  - Open risk: relation grouping currently exposes one mapping row per linked outcome pair (YES and NO separately), which is correct for execution but may require aggregation if a consumer expects one row per market pair.
+- 2026-03-04 16:13 EST (README API docs pass)
+  - Expanded README with a full API reference: normalize, preview, pair CRUD/list/load/update/delete, and monitoring endpoint contract.
+  - Added concrete request/response examples and behavior notes for monitoring mappings.
+  - Verification: `make test` passed (19 tests).

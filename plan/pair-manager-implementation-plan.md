@@ -76,7 +76,7 @@
 - "Active mapping" query excludes expired pairs by default.
 - Deliverable: monitoring-read API returns only active/non-expired mappings.
 
-9. **Phase 8: Monitoring-facing API**
+9. **Phase 8: Monitoring-facing API (Completed on 2026-03-04)**
 - Add endpoint for downstream bots/services:
   - `GET /api/monitoring/pairs?active_only=true`
 - Response includes only fields needed for monitoring:

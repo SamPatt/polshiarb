@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse
@@ -58,9 +58,27 @@ class PairListResponse(BaseModel):
     status: str = "all"
 
 
+class MonitoringLeg(BaseModel):
+    exchange: Literal["kalshi", "polymarket"]
+    market_id: str
+    outcome_id: str | None = None
+
+
+class MonitoringMapping(BaseModel):
+    relation_type: str
+    legs: list[MonitoringLeg]
+
+
+class MonitoringPair(BaseModel):
+    pair_id: int
+    recurrence_intent: str | None = None
+    expires_at: str | None = None
+    mappings: list[MonitoringMapping] = Field(default_factory=list)
+
+
 class MonitoringPairsResponse(BaseModel):
     ok: bool
-    links: list[dict[str, Any]] = Field(default_factory=list)
+    pairs: list[MonitoringPair] = Field(default_factory=list)
     active_only: bool = True
     include_expired: bool = False
 
@@ -226,9 +244,50 @@ def get_monitoring_pairs(
         active_only=active_only,
         include_expired=include_expired,
     )
+
+    grouped_pairs: dict[int, MonitoringPair] = {}
+    for link in links:
+        pair_id = int(link["pair_id"])
+        pair = grouped_pairs.get(pair_id)
+        if pair is None:
+            pair = MonitoringPair(
+                pair_id=pair_id,
+                recurrence_intent=link.get("recurrence_intent"),
+                expires_at=link.get("expires_at"),
+                mappings=[],
+            )
+            grouped_pairs[pair_id] = pair
+
+        pair.mappings.append(
+            MonitoringMapping(
+                relation_type=str(link.get("relation_type") or "same_direction"),
+                legs=[
+                    MonitoringLeg(
+                        exchange="kalshi",
+                        market_id=str(link["kalshi_market_id"]),
+                        outcome_id=(
+                            str(link["kalshi_outcome_id"])
+                            if link.get("kalshi_outcome_id") is not None
+                            else None
+                        ),
+                    ),
+                    MonitoringLeg(
+                        exchange="polymarket",
+                        market_id=str(link["polymarket_market_id"]),
+                        outcome_id=(
+                            str(link["polymarket_outcome_id"])
+                            if link.get("polymarket_outcome_id") is not None
+                            else None
+                        ),
+                    ),
+                ],
+            )
+        )
+
+    ordered_pairs = sorted(grouped_pairs.values(), key=lambda item: item.pair_id, reverse=True)
     return MonitoringPairsResponse(
         ok=True,
-        links=links,
+        pairs=ordered_pairs,
         active_only=active_only,
         include_expired=include_expired,
     )
