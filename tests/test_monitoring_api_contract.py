@@ -130,5 +130,7 @@ def test_monitoring_pairs_contract_with_flags(tmp_path: Path, monkeypatch) -> No
     assert payload["ok"] is True
     assert payload["active_only"] is False
     assert payload["include_expired"] is True
-    assert len(payload["pairs"]) == 3
+    # Latest pair wins for duplicated mappings across pair sets.
+    assert len(payload["pairs"]) == 1
+    assert payload["pairs"][0]["pair_id"] == 3
     assert all(len(pair["mappings"]) == 2 for pair in payload["pairs"])

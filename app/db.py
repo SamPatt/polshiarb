@@ -481,6 +481,7 @@ def list_monitoring_links(
     db_path: Path | str,
     active_only: bool = True,
     include_expired: bool = False,
+    dedupe_latest: bool = True,
 ) -> list[dict[str, Any]]:
     init_db(db_path)
     connection = _connect(db_path)
@@ -510,6 +511,7 @@ def list_monitoring_links(
         ).fetchall()
 
         links: list[dict[str, Any]] = []
+        seen_dedupe_keys: set[tuple[str, str, str, str | None, str | None]] = set()
         for row in rows:
             is_expired = _is_expired(row["expires_at"])
             is_active = bool(row["active"])
@@ -517,6 +519,21 @@ def list_monitoring_links(
                 continue
             if not include_expired and is_expired:
                 continue
+
+            dedupe_key = (
+                str(row["kalshi_market_id"]),
+                str(row["polymarket_market_id"]),
+                str(row["relation_type"]),
+                (str(row["kalshi_outcome_id"]) if row["kalshi_outcome_id"] is not None else None),
+                (
+                    str(row["polymarket_outcome_id"])
+                    if row["polymarket_outcome_id"] is not None
+                    else None
+                ),
+            )
+            if dedupe_latest and dedupe_key in seen_dedupe_keys:
+                continue
+            seen_dedupe_keys.add(dedupe_key)
 
             links.append(
                 {

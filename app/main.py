@@ -334,6 +334,7 @@ def get_monitoring_pairs(
             db_path=DEFAULT_DB_PATH,
             active_only=active_only,
             include_expired=include_expired,
+            dedupe_latest=True,
         )
     except Exception as exc:
         logger.exception(

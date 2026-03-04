@@ -155,3 +155,10 @@ Use this file to keep a running record of what we learn about the repo and excha
   - Marked Phase 9 complete in the implementation plan.
   - Verification: `make test` passed (22 tests).
   - Open risk: endpoints still use HTTP 200 for handled failures; if strict HTTP semantics are required, migrate to `HTTPException`/status codes in a follow-up.
+- 2026-03-04 16:31 EST (monitoring dedupe policy: latest pair wins)
+  - Updated `list_monitoring_links` in `app/db.py` to dedupe duplicate mappings across pair sets by default.
+  - Dedupe key uses exchange market IDs + outcome IDs + relation type; ordering already prioritizes newest pair set IDs, so latest pair wins.
+  - Wired monitoring endpoint to explicitly use dedupe mode.
+  - Updated tests in `tests/test_pair_persistence.py` and `tests/test_monitoring_api_contract.py` to assert latest-wins behavior.
+  - Added README note documenting the dedupe policy.
+  - Verification: `make test` passed (22 tests).

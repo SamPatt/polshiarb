@@ -221,6 +221,7 @@ Response shape (stable contract):
 Notes:
 - `pairs[].mappings[]` is outcome-link level (for `same_direction`, typically YES and NO rows).
 - Each mapping has exactly two legs: one Kalshi leg and one Polymarket leg.
+- If duplicate mappings exist across multiple pair sets, the monitoring endpoint keeps only the latest pair-set version (highest `pair_id`).
 
 ### PMXT health check
 

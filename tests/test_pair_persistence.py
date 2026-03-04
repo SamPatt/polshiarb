@@ -211,16 +211,24 @@ def test_monitoring_links_filter_expired_and_inactive(tmp_path: Path) -> None:
     default_rows = list_monitoring_links(db_path)
     with_expired_rows = list_monitoring_links(db_path, include_expired=True)
     include_inactive_rows = list_monitoring_links(db_path, active_only=False)
+    include_all_rows = list_monitoring_links(db_path, active_only=False, include_expired=True)
 
-    # Default: active-only and non-expired.
+    # Default: active-only, non-expired, and deduped (latest-wins among filtered rows).
     assert len(default_rows) == 2
     assert all(row["active"] is True for row in default_rows)
     assert all(row["is_expired"] is False for row in default_rows)
+    assert {row["pair_id"] for row in default_rows} == {1}
 
-    # Include expired adds the expired active pair (+2 outcome-link rows).
-    assert len(with_expired_rows) == 4
+    # Include expired now picks pair #2 as the latest active duplicate.
+    assert len(with_expired_rows) == 2
     assert any(row["is_expired"] is True for row in with_expired_rows)
+    assert {row["pair_id"] for row in with_expired_rows} == {2}
 
-    # Include inactive adds the non-expired inactive pair (+2 rows).
-    assert len(include_inactive_rows) == 4
+    # Include inactive now picks pair #3 as the latest non-expired duplicate.
+    assert len(include_inactive_rows) == 2
     assert any(row["active"] is False for row in include_inactive_rows)
+    assert {row["pair_id"] for row in include_inactive_rows} == {3}
+
+    # Include everything keeps only latest duplicate overall (pair #3).
+    assert len(include_all_rows) == 2
+    assert {row["pair_id"] for row in include_all_rows} == {3}
