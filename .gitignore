@@ -3,3 +3,4 @@ PMXT_PYTHON_API_REFERENCE.md
 .env.rookforge
 .venv/
 __pycache__/
+data/

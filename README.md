@@ -22,3 +22,59 @@ The core contract remains:
 - For setup/sanity steps (startup path, health checks, caveats), see the TODO task list.
 
 The full Python SDK API reference is in [`PMXT_PYTHON_API_REFERENCE.md`](./PMXT_PYTHON_API_REFERENCE.md).
+
+## Local setup and run
+
+The repo now includes a Phase 1 web skeleton:
+- FastAPI backend (`app/main.py`)
+- Server-rendered UI template (`templates/index.html`)
+- Local SQLite bootstrap (`app/db.py`)
+
+### Prerequisites
+
+- `python3` available on your PATH
+- Internet access for first-time dependency install
+
+### First-time setup
+
+```bash
+make setup
+```
+
+This creates `.venv`, upgrades `pip`, and installs pinned dependencies from `requirements.txt`.
+
+### Initialize local DB
+
+```bash
+make init-db
+```
+
+This creates `data/pair_manager.db`.
+
+### Run the web app
+
+```bash
+make run-web
+```
+
+Default URL:
+- `http://127.0.0.1:8011/`
+
+Health endpoint:
+- `http://127.0.0.1:8011/healthz`
+
+### PMXT health check
+
+```bash
+make check-pmxt
+```
+
+This validates PMXT + sidecar connectivity with a minimal fetch on Polymarket and Kalshi.
+
+### Optional port override
+
+If you want a different port temporarily:
+
+```bash
+PORT=8020 make run-web
+```

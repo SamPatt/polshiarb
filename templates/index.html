@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ page_title }}</title>
+    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+    <style>
+      body {
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        max-width: 880px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+        line-height: 1.4;
+      }
+      .card {
+        border: 1px solid #ccc;
+        border-radius: 8px;
+        padding: 1rem;
+      }
+      label {
+        display: block;
+        margin-top: 1rem;
+      }
+      input[type="url"] {
+        width: 100%;
+        padding: 0.5rem;
+        margin-top: 0.25rem;
+      }
+      button {
+        margin-top: 1rem;
+        padding: 0.6rem 1rem;
+      }
+      .muted {
+        color: #555;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>{{ page_title }}</h1>
+    <p class="muted">
+      Phase 1 skeleton is running. URL parsing, market fetching, and pair mapping will be added in next phases.
+    </p>
+
+    <section class="card">
+      <h2>Add Pair (Preview)</h2>
+      <form>
+        <label for="kalshi_url">Kalshi URL</label>
+        <input id="kalshi_url" name="kalshi_url" type="url" placeholder="https://kalshi.com/markets/...">
+
+        <label for="pm_url">Polymarket URL</label>
+        <input id="pm_url" name="pm_url" type="url" placeholder="https://polymarket.com/event/...">
+
+        <button type="button" disabled>Load Pair (Phase 2)</button>
+      </form>
+    </section>
+  </body>
+</html>

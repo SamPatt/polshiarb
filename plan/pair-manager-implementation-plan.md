@@ -16,7 +16,7 @@
 - Add a short health script that checks `pmxt` import and one fetch call per exchange.
 - Deliverable: repeatable `make check-pmxt` (or equivalent) that passes locally.
 
-2. **Phase 1: Project skeleton**
+2. **Phase 1: Project skeleton (Completed on 2026-03-03)**
 - Backend: FastAPI service.
 - Frontend: server-rendered templates (Jinja + HTMX) for speed and lower complexity.
 - DB: SQLite initially (easy local), schema ready to move to Postgres later.
@@ -96,11 +96,12 @@
 
 ## Implementation Order (small-step)
 1. Phase 0
-2. Phase 2
-3. Phase 3
-4. Phase 4
-5. Phase 5
-6. Phase 6
-7. Phase 7
-8. Phase 8
-9. Phase 9
+2. Phase 1
+3. Phase 2
+4. Phase 3
+5. Phase 4
+6. Phase 5
+7. Phase 6
+8. Phase 7
+9. Phase 8
+10. Phase 9
