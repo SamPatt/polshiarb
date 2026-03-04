@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
+import re
 from typing import Any, Protocol
 
 import pmxt
@@ -89,6 +90,7 @@ class PMXTAdapter:
     def __init__(self, polymarket_client: Any | None = None, kalshi_client: Any | None = None) -> None:
         self.polymarket = polymarket_client or pmxt.Polymarket()
         self.kalshi = kalshi_client or pmxt.Kalshi()
+        self._kalshi_matchup_cache: dict[str, list[dict[str, Any]]] = {}
 
     def preview_from_normalized(
         self, normalized: dict[str, dict[str, str]]
@@ -109,10 +111,16 @@ class PMXTAdapter:
         # Prefer event fetch to get the full candidate/contract stack; fallback to single market.
         try:
             event = self.kalshi.fetch_event(slug=ticker)
+            event_dict = _to_dict(event)
+            matchup_key = self._extract_matchup_key(event_dict.get("id") or ticker)
+            if matchup_key:
+                expanded = self._expand_kalshi_matchup_markets(matchup_key)
+                if expanded:
+                    event_dict["markets"] = expanded
             return {
                 "entity_type": "event",
                 "lookup": lookup,
-                "event": _normalize_event(event),
+                "event": _normalize_event(event_dict),
             }
         except Exception:
             pass
@@ -128,6 +136,48 @@ class PMXTAdapter:
             raise PMXTAdapterError(
                 f"Kalshi fetch failed for ticker/event '{ticker}': {exc}"
             ) from exc
+
+    def _extract_matchup_key(self, value: str | None) -> str | None:
+        if not value:
+            return None
+        parts = value.upper().split("-", maxsplit=1)
+        if len(parts) != 2:
+            return None
+
+        candidate = parts[1]
+        # Sports matchup keys look like 26MAR03NOPLAL.
+        if re.fullmatch(r"\d{2}[A-Z]{3}\d{2}[A-Z0-9]+", candidate):
+            return candidate
+        return None
+
+    def _expand_kalshi_matchup_markets(self, matchup_key: str) -> list[dict[str, Any]]:
+        if matchup_key in self._kalshi_matchup_cache:
+            return self._kalshi_matchup_cache[matchup_key]
+
+        try:
+            self.kalshi.load_markets(reload=False)
+        except TypeError:
+            self.kalshi.load_markets(False)
+        except Exception:
+            return []
+
+        all_markets = list(getattr(self.kalshi, "markets", {}).values())
+        selected: dict[str, dict[str, Any]] = {}
+        marker = f"-{matchup_key}-"
+        suffix = f"-{matchup_key}"
+
+        for market in all_markets:
+            raw = _to_dict(market)
+            market_id = (raw.get("market_id") or "").upper()
+            if not market_id:
+                continue
+            if marker in market_id or market_id.endswith(suffix):
+                selected[market_id] = raw
+
+        expanded = list(selected.values())
+        expanded.sort(key=lambda m: (m.get("title") or "", m.get("market_id") or ""))
+        self._kalshi_matchup_cache[matchup_key] = expanded
+        return expanded
 
     def _fetch_polymarket(self, lookup: dict[str, str]) -> dict[str, Any]:
         if lookup.get("lookup_type") != "event_slug":

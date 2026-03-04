@@ -92,3 +92,12 @@ Use this file to keep a running record of what we learn about the repo and excha
   - Added temporary prefilled test URLs for Kalshi/Polymarket inputs and auto-submit on page load for faster iteration.
   - Verification: `make test` passed (8 tests); page HTML confirms prefilled URLs, auto-load hook, and pill-click logic wiring.
   - Open risk: pill text matching uses heuristic matching (label/title text + polarity); may need stricter/fuzzier tuning per event type.
+- 2026-03-04 12:20 EST (sports URL parser support)
+  - Expanded Polymarket URL parser to support sports URL format: `/sports/{league}/{slug}`.
+  - Added unit tests for valid sports URL parsing and an invalid short sports path case.
+  - Verification: `make test` passed (10 tests), and live `/api/preview` request succeeds for the NBA sample pair.
+- 2026-03-04 22:58 EST (kalshi sports matchup expansion)
+  - Updated `app/pmxt_adapter.py` to expand Kalshi sports previews by matchup key (e.g., `26MAR03NOPLAL`) via `kalshi.load_markets`, not just the base `KXNBAGAME` event.
+  - Expansion now includes related market families for the same matchup key (winner, spread, total, team totals, and player props when available).
+  - Added adapter tests in `tests/test_pmxt_adapter.py` for expansion behavior, including exclusion of unrelated matchup markets.
+  - Verification: `make test` passed (11 tests); live preview for NBA sample now shows Kalshi `event.markets=221` with spread/total/player props present.

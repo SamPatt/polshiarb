@@ -42,8 +42,19 @@ def parse_polymarket_url(url: str) -> NormalizedURL:
             lookup_value=slug,
         )
 
+    # Sports pages use /sports/{league}/{event-slug} but still map to an event slug.
+    if len(segments) >= 3 and segments[0] == "sports":
+        slug = segments[-1]
+        return NormalizedURL(
+            exchange="polymarket",
+            original_url=url,
+            canonical_url=f"https://polymarket.com/sports/{segments[1]}/{slug}",
+            lookup_type="event_slug",
+            lookup_value=slug,
+        )
+
     raise URLNormalizationError(
-        "Unsupported Polymarket URL format. Expected /event/{slug}"
+        "Unsupported Polymarket URL format. Expected /event/{slug} or /sports/{league}/{slug}"
     )
 
 
