@@ -124,3 +124,12 @@ Use this file to keep a running record of what we learn about the repo and excha
   - Marked Phase 6 complete in the implementation plan.
   - Verification: `make test` passed (16 tests).
   - Open risk: edit mode currently reconstructs preview from saved snapshots; if a pair was saved with incomplete snapshots, an explicit re-fetch via URL preview is still needed before update.
+- 2026-03-04 16:02 EST (phase 7 expiration behavior)
+  - Added expiration-aware monitoring read path in `app/db.py` via `list_monitoring_links(active_only=True, include_expired=False)`.
+  - Added reusable `_is_expired` helper and applied it in pair list filtering to keep expiration logic consistent.
+  - Added monitoring API endpoint in `app/main.py`: `GET /api/monitoring/pairs` with `active_only` and `include_expired` query params.
+  - Updated `templates/index.html` expiration input with a dedicated `Clear` button for quick reset to nullable expiration.
+  - Added persistence tests in `tests/test_pair_persistence.py` validating monitoring filtering of expired and inactive links.
+  - Marked Phase 7 complete in the implementation plan.
+  - Verification: `make test` passed (17 tests).
+  - Open risk: monitoring endpoint currently returns a flat list of outcome-link rows; Phase 8 may still want a grouped pair-centric contract depending on downstream consumer preference.

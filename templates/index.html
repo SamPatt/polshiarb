@@ -92,6 +92,18 @@
         grid-template-columns: 1fr 1fr;
         gap: 0.75rem;
       }
+      .date-row {
+        display: flex;
+        gap: 0.45rem;
+        align-items: center;
+      }
+      .date-row input[type="date"] {
+        flex: 1;
+      }
+      .date-row button {
+        margin-top: 0.25rem;
+        white-space: nowrap;
+      }
       .error {
         color: #ff7d8c;
       }
@@ -243,7 +255,10 @@
           </div>
           <div>
             <label for="expires_at">Expiration Date (optional)</label>
-            <input id="expires_at" name="expires_at" type="date">
+            <div class="date-row">
+              <input id="expires_at" name="expires_at" type="date">
+              <button id="clear-expires-at" type="button" class="button-ghost">Clear</button>
+            </div>
           </div>
         </div>
 
@@ -283,6 +298,7 @@
       const saveButton = document.getElementById("save-pair");
       const recurrenceIntentInput = document.getElementById("recurrence_intent");
       const expiresAtInput = document.getElementById("expires_at");
+      const clearExpiresAtButton = document.getElementById("clear-expires-at");
 
       const state = {
         cards: {
@@ -1029,6 +1045,10 @@
         } finally {
           updateSaveButtonState();
         }
+      });
+
+      clearExpiresAtButton.addEventListener("click", () => {
+        expiresAtInput.value = "";
       });
 
       window.addEventListener("DOMContentLoaded", () => {

@@ -13,6 +13,7 @@ from app.db import (
     delete_pair_set,
     init_db,
     list_pair_sets,
+    list_monitoring_links,
     load_pair_set,
     save_pair_set,
     update_pair_set,
@@ -55,6 +56,13 @@ class PairListResponse(BaseModel):
     ok: bool
     pairs: list[dict[str, Any]] = Field(default_factory=list)
     status: str = "all"
+
+
+class MonitoringPairsResponse(BaseModel):
+    ok: bool
+    links: list[dict[str, Any]] = Field(default_factory=list)
+    active_only: bool = True
+    include_expired: bool = False
 
 
 @lru_cache(maxsize=1)
@@ -206,3 +214,21 @@ def remove_pair(pair_id: int) -> dict[str, object]:
     if not deleted:
         return {"ok": False, "error": f"Pair {pair_id} not found"}
     return {"ok": True, "pair_id": pair_id}
+
+
+@app.get("/api/monitoring/pairs")
+def get_monitoring_pairs(
+    active_only: bool = Query(default=True),
+    include_expired: bool = Query(default=False),
+) -> MonitoringPairsResponse:
+    links = list_monitoring_links(
+        db_path=DEFAULT_DB_PATH,
+        active_only=active_only,
+        include_expired=include_expired,
+    )
+    return MonitoringPairsResponse(
+        ok=True,
+        links=links,
+        active_only=active_only,
+        include_expired=include_expired,
+    )

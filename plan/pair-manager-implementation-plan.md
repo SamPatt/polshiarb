@@ -70,7 +70,7 @@
   - update expiration date
 - Deliverable: complete CRUD for pair sets and mappings.
 
-8. **Phase 7: Expiration behavior**
+8. **Phase 7: Expiration behavior (Completed on 2026-03-04)**
 - `expires_at` nullable (default `NULL` = no expiration).
 - UI date picker with clear option.
 - "Active mapping" query excludes expired pairs by default.

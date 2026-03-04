@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.db import delete_pair_set, init_db, list_pair_sets, load_pair_set, save_pair_set, update_pair_set
+from app.db import (
+    delete_pair_set,
+    init_db,
+    list_monitoring_links,
+    list_pair_sets,
+    load_pair_set,
+    save_pair_set,
+    update_pair_set,
+)
 
 
 def _sample_payload() -> dict:
@@ -182,3 +190,37 @@ def test_delete_pair_set_removes_pair(tmp_path: Path) -> None:
     assert delete_pair_set(db_path, saved["pair_id"]) is True
     assert delete_pair_set(db_path, saved["pair_id"]) is False
     assert load_pair_set(db_path, saved["pair_id"]) is None
+
+
+def test_monitoring_links_filter_expired_and_inactive(tmp_path: Path) -> None:
+    db_path = tmp_path / "pairs_monitoring.db"
+
+    active_payload = _sample_payload()
+    active_payload["expires_at"] = "2099-01-01"
+    save_pair_set(db_path, active_payload)
+
+    expired_payload = _sample_payload()
+    expired_payload["expires_at"] = "2000-01-01"
+    save_pair_set(db_path, expired_payload)
+
+    inactive_payload = _sample_payload()
+    inactive_payload["expires_at"] = "2099-01-01"
+    inactive_payload["matches"][0]["active"] = False
+    save_pair_set(db_path, inactive_payload)
+
+    default_rows = list_monitoring_links(db_path)
+    with_expired_rows = list_monitoring_links(db_path, include_expired=True)
+    include_inactive_rows = list_monitoring_links(db_path, active_only=False)
+
+    # Default: active-only and non-expired.
+    assert len(default_rows) == 2
+    assert all(row["active"] is True for row in default_rows)
+    assert all(row["is_expired"] is False for row in default_rows)
+
+    # Include expired adds the expired active pair (+2 outcome-link rows).
+    assert len(with_expired_rows) == 4
+    assert any(row["is_expired"] is True for row in with_expired_rows)
+
+    # Include inactive adds the non-expired inactive pair (+2 rows).
+    assert len(include_inactive_rows) == 4
+    assert any(row["active"] is False for row in include_inactive_rows)

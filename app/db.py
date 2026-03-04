@@ -167,6 +167,16 @@ def _extract_lookup_value(
     return existing_value
 
 
+def _is_expired(expires_at: Any, today: date | None = None) -> bool:
+    if not isinstance(expires_at, str) or not expires_at:
+        return False
+    try:
+        reference_day = today or date.today()
+        return date.fromisoformat(expires_at) < reference_day
+    except ValueError:
+        return False
+
+
 def _persist_pair_markets(
     connection: sqlite3.Connection, pair_id: int, preview: dict[str, Any]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -438,16 +448,10 @@ def list_pair_sets(db_path: Path | str, status: str = "all") -> list[dict[str, A
             """
         ).fetchall()
 
-        today = date.today()
         pairs: list[dict[str, Any]] = []
         for row in rows:
             expires_at = row["expires_at"]
-            is_expired = False
-            if isinstance(expires_at, str) and expires_at:
-                try:
-                    is_expired = date.fromisoformat(expires_at) < today
-                except ValueError:
-                    is_expired = False
+            is_expired = _is_expired(expires_at)
 
             pair = {
                 "id": row["id"],
@@ -469,6 +473,72 @@ def list_pair_sets(db_path: Path | str, status: str = "all") -> list[dict[str, A
         if status == "expired":
             return [pair for pair in pairs if pair["is_expired"]]
         return pairs
+    finally:
+        connection.close()
+
+
+def list_monitoring_links(
+    db_path: Path | str,
+    active_only: bool = True,
+    include_expired: bool = False,
+) -> list[dict[str, Any]]:
+    init_db(db_path)
+    connection = _connect(db_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT
+                ps.id AS pair_id,
+                ps.kalshi_url,
+                ps.polymarket_url,
+                ps.recurrence_intent,
+                ps.expires_at,
+                ps.created_at AS pair_created_at,
+                ps.updated_at AS pair_updated_at,
+                pol.id AS outcome_link_id,
+                pol.kalshi_market_id,
+                pol.polymarket_market_id,
+                pol.kalshi_outcome_id,
+                pol.polymarket_outcome_id,
+                pol.relation_type,
+                pol.active,
+                pol.created_at AS outcome_link_created_at
+            FROM pair_outcome_links pol
+            JOIN pair_sets ps ON ps.id = pol.pair_set_id
+            ORDER BY ps.id DESC, pol.id ASC
+            """
+        ).fetchall()
+
+        links: list[dict[str, Any]] = []
+        for row in rows:
+            is_expired = _is_expired(row["expires_at"])
+            is_active = bool(row["active"])
+            if active_only and not is_active:
+                continue
+            if not include_expired and is_expired:
+                continue
+
+            links.append(
+                {
+                    "pair_id": row["pair_id"],
+                    "kalshi_url": row["kalshi_url"],
+                    "polymarket_url": row["polymarket_url"],
+                    "recurrence_intent": row["recurrence_intent"],
+                    "expires_at": row["expires_at"],
+                    "is_expired": is_expired,
+                    "pair_created_at": row["pair_created_at"],
+                    "pair_updated_at": row["pair_updated_at"],
+                    "outcome_link_id": row["outcome_link_id"],
+                    "kalshi_market_id": row["kalshi_market_id"],
+                    "polymarket_market_id": row["polymarket_market_id"],
+                    "kalshi_outcome_id": row["kalshi_outcome_id"],
+                    "polymarket_outcome_id": row["polymarket_outcome_id"],
+                    "relation_type": row["relation_type"],
+                    "active": is_active,
+                    "outcome_link_created_at": row["outcome_link_created_at"],
+                }
+            )
+        return links
     finally:
         connection.close()
 
