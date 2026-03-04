@@ -50,7 +50,7 @@
 - Add optional recurrence intent at pair level (e.g., one-off, daily, weekly, rolling-next).
 - Deliverable: user can create mappings in the browser without manual IDs.
 
-6. **Phase 5: Persistence model + save flow**
+6. **Phase 5: Persistence model + save flow (Completed on 2026-03-04)**
 - DB tables:
   - `pair_sets` (pair metadata, URLs, expiration, timestamps)
   - `pair_markets` (normalized market snapshots)
@@ -61,7 +61,7 @@
 - Save action writes all selected mappings atomically in one transaction.
 - Deliverable: saved pair survives restart and can be queried by ID.
 
-7. **Phase 6: View + edit existing pairs**
+7. **Phase 6: View + edit existing pairs (Completed on 2026-03-04)**
 - Build list page with search/filter (`active`, `expired`, `all`).
 - Build edit page:
   - update URLs (optional re-fetch)

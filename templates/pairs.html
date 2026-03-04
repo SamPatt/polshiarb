@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ page_title }}</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        background: radial-gradient(circle at top, #1a2230 0%, #0b1018 42%, #070b12 100%);
+        color: #e6edf3;
+        max-width: 1240px;
+        margin: 2rem auto;
+        padding: 0 1rem 2rem;
+      }
+      a {
+        color: #7cc7ff;
+      }
+      .card {
+        border: 1px solid #263343;
+        border-radius: 10px;
+        padding: 1rem;
+        background: #121a24;
+      }
+      .toolbar {
+        display: flex;
+        gap: 0.75rem;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      select,
+      button {
+        padding: 0.5rem 0.7rem;
+        background: #0c121a;
+        border: 1px solid #2f4257;
+        border-radius: 8px;
+        color: #e6edf3;
+      }
+      button {
+        cursor: pointer;
+      }
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.6;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 1rem;
+      }
+      th,
+      td {
+        border-bottom: 1px solid #253548;
+        padding: 0.55rem 0.45rem;
+        text-align: left;
+        vertical-align: top;
+      }
+      th {
+        color: #9eb2c7;
+        font-weight: 600;
+      }
+      .muted {
+        color: #8fa6be;
+      }
+      .status {
+        margin-top: 0.8rem;
+        min-height: 1.2rem;
+      }
+      .error {
+        color: #ff7d8c;
+      }
+      .ok {
+        color: #7ce2a6;
+      }
+      .pill {
+        display: inline-block;
+        border: 1px solid #3f5872;
+        border-radius: 999px;
+        padding: 0.1rem 0.5rem;
+        font-size: 0.78rem;
+      }
+      .pill.expired {
+        border-color: #7a4450;
+        background: #311d23;
+      }
+      .pill.active {
+        border-color: #447a61;
+        background: #1f342a;
+      }
+      .actions {
+        display: flex;
+        gap: 0.45rem;
+        flex-wrap: wrap;
+      }
+      @media (max-width: 900px) {
+        table,
+        thead,
+        tbody,
+        th,
+        td,
+        tr {
+          display: block;
+        }
+        thead {
+          display: none;
+        }
+        tr {
+          margin-bottom: 1rem;
+          border: 1px solid #2b3c4f;
+          border-radius: 8px;
+          padding: 0.4rem;
+        }
+        td {
+          border: 0;
+          padding: 0.3rem 0.4rem;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <h1>{{ page_title }}</h1>
+    <p class="muted">
+      Browse saved pair sets, filter by status, and open any pair in edit mode.
+      <a href="/">Create New Pair</a>
+    </p>
+
+    <section class="card">
+      <div class="toolbar">
+        <label for="status_filter">Filter</label>
+        <select id="status_filter">
+          <option value="all">All</option>
+          <option value="active">Active</option>
+          <option value="expired">Expired</option>
+        </select>
+        <button id="refresh" type="button">Refresh</button>
+      </div>
+      <div id="status" class="status muted"></div>
+      <div style="overflow-x: auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Status</th>
+              <th>Kalshi URL</th>
+              <th>Polymarket URL</th>
+              <th>Links</th>
+              <th>Expires</th>
+              <th>Updated</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="pairs-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <script>
+      const filterInput = document.getElementById("status_filter");
+      const refreshButton = document.getElementById("refresh");
+      const statusEl = document.getElementById("status");
+      const tbody = document.getElementById("pairs-body");
+
+      const setStatus = (message, kind = "muted") => {
+        statusEl.textContent = message;
+        statusEl.className = `status ${kind}`;
+      };
+
+      const renderRows = (pairs) => {
+        tbody.textContent = "";
+        if (!pairs.length) {
+          const row = document.createElement("tr");
+          const cell = document.createElement("td");
+          cell.colSpan = 8;
+          cell.className = "muted";
+          cell.textContent = "No saved pairs found.";
+          row.appendChild(cell);
+          tbody.appendChild(row);
+          return;
+        }
+
+        pairs.forEach((pair) => {
+          const row = document.createElement("tr");
+
+          const idCell = document.createElement("td");
+          idCell.textContent = `#${pair.id}`;
+          row.appendChild(idCell);
+
+          const statusCell = document.createElement("td");
+          const expiryPill = document.createElement("span");
+          expiryPill.className = `pill ${pair.is_expired ? "expired" : "active"}`;
+          expiryPill.textContent = pair.is_expired ? "Expired" : "Not expired";
+          statusCell.appendChild(expiryPill);
+          row.appendChild(statusCell);
+
+          const kalshiCell = document.createElement("td");
+          kalshiCell.textContent = pair.kalshi_url;
+          row.appendChild(kalshiCell);
+
+          const polymarketCell = document.createElement("td");
+          polymarketCell.textContent = pair.polymarket_url;
+          row.appendChild(polymarketCell);
+
+          const linksCell = document.createElement("td");
+          linksCell.textContent = `${pair.active_link_rows}/${pair.link_rows} active`;
+          row.appendChild(linksCell);
+
+          const expiresCell = document.createElement("td");
+          expiresCell.textContent = pair.expires_at || "None";
+          row.appendChild(expiresCell);
+
+          const updatedCell = document.createElement("td");
+          updatedCell.textContent = pair.updated_at;
+          row.appendChild(updatedCell);
+
+          const actionsCell = document.createElement("td");
+          const actions = document.createElement("div");
+          actions.className = "actions";
+
+          const editLink = document.createElement("a");
+          editLink.href = `/pairs/${pair.id}/edit`;
+          editLink.textContent = "Edit";
+          actions.appendChild(editLink);
+
+          const deleteButton = document.createElement("button");
+          deleteButton.type = "button";
+          deleteButton.textContent = "Delete";
+          deleteButton.addEventListener("click", async () => {
+            const confirmed = window.confirm(
+              `Delete pair #${pair.id}? This removes markets and outcome links.`
+            );
+            if (!confirmed) {
+              return;
+            }
+            deleteButton.disabled = true;
+            try {
+              const response = await fetch(`/api/pairs/${pair.id}`, { method: "DELETE" });
+              const payload = await response.json();
+              if (!payload.ok) {
+                setStatus(payload.error || "Delete failed.", "error");
+                deleteButton.disabled = false;
+                return;
+              }
+              setStatus(`Deleted pair #${pair.id}.`, "ok");
+              await loadPairs();
+            } catch (error) {
+              setStatus(`Delete request failed: ${error}`, "error");
+              deleteButton.disabled = false;
+            }
+          });
+          actions.appendChild(deleteButton);
+
+          actionsCell.appendChild(actions);
+          row.appendChild(actionsCell);
+
+          tbody.appendChild(row);
+        });
+      };
+
+      const loadPairs = async () => {
+        const status = filterInput.value;
+        setStatus("Loading pairs...");
+        refreshButton.disabled = true;
+        try {
+          const response = await fetch(`/api/pairs?status=${encodeURIComponent(status)}`);
+          const payload = await response.json();
+          if (!payload.ok) {
+            setStatus("Failed to load pairs.", "error");
+            renderRows([]);
+            return;
+          }
+          renderRows(payload.pairs || []);
+          setStatus(`Loaded ${payload.pairs.length} pair(s).`, "ok");
+        } catch (error) {
+          setStatus(`Request failed: ${error}`, "error");
+          renderRows([]);
+        } finally {
+          refreshButton.disabled = false;
+        }
+      };
+
+      refreshButton.addEventListener("click", () => {
+        loadPairs();
+      });
+      filterInput.addEventListener("change", () => {
+        loadPairs();
+      });
+      window.addEventListener("DOMContentLoaded", () => {
+        loadPairs();
+      });
+    </script>
+  </body>
+</html>

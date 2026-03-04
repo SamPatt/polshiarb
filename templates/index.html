@@ -40,7 +40,22 @@
         border-radius: 8px;
         color: #e6edf3;
       }
+      select,
+      input[type="date"] {
+        width: 100%;
+        padding: 0.55rem;
+        margin-top: 0.25rem;
+        background: #0c121a;
+        border: 1px solid #2f4257;
+        border-radius: 8px;
+        color: #e6edf3;
+      }
       input[type="url"]:focus {
+        outline: 2px solid #5fa8ff;
+        outline-offset: 1px;
+      }
+      select:focus,
+      input[type="date"]:focus {
         outline: 2px solid #5fa8ff;
         outline-offset: 1px;
       }
@@ -71,6 +86,11 @@
       .status {
         margin-top: 0.75rem;
         min-height: 1.2rem;
+      }
+      .inline-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 0.75rem;
       }
       .error {
         color: #ff7d8c;
@@ -181,6 +201,7 @@
     <h1>{{ page_title }}</h1>
     <p class="muted">
       Paste one Kalshi URL and one Polymarket URL to preview market/event options and match them directly in the UI.
+      <a href="/pairs">View saved pairs</a>
     </p>
 
     <section class="card">
@@ -208,6 +229,28 @@
 
         <button id="preview-submit" type="submit">Load Pair Preview</button>
         <div id="preview-status" class="status muted"></div>
+
+        <div class="inline-grid">
+          <div>
+            <label for="recurrence_intent">Recurrence Intent</label>
+            <select id="recurrence_intent" name="recurrence_intent">
+              <option value="">None</option>
+              <option value="one_off">One-off</option>
+              <option value="daily">Daily</option>
+              <option value="weekly">Weekly</option>
+              <option value="rolling_next">Rolling-next</option>
+            </select>
+          </div>
+          <div>
+            <label for="expires_at">Expiration Date (optional)</label>
+            <input id="expires_at" name="expires_at" type="date">
+          </div>
+        </div>
+
+        <button id="save-pair" type="button" class="button-ghost" disabled>
+          {% if is_edit_mode %}Update Pair{% else %}Save Pair{% endif %}
+        </button>
+        <div id="save-status" class="status muted"></div>
       </form>
     </section>
 
@@ -225,14 +268,21 @@
     </section>
 
     <script>
+      const isEditMode = {{ "true" if is_edit_mode else "false" }};
+      const editPairId = {{ edit_pair_id if edit_pair_id is not none else "null" }};
+
       const form = document.getElementById("preview-form");
       const submitButton = document.getElementById("preview-submit");
       const statusEl = document.getElementById("preview-status");
+      const saveStatusEl = document.getElementById("save-status");
       const resultsEl = document.getElementById("preview-results");
       const kalshiStack = document.getElementById("kalshi-stack");
       const polymarketStack = document.getElementById("polymarket-stack");
       const kalshiInput = document.getElementById("kalshi_url");
       const polymarketInput = document.getElementById("pm_url");
+      const saveButton = document.getElementById("save-pair");
+      const recurrenceIntentInput = document.getElementById("recurrence_intent");
+      const expiresAtInput = document.getElementById("expires_at");
 
       const state = {
         cards: {
@@ -243,6 +293,9 @@
         pairCounter: 1,
         colorIndex: 0,
         highlight: null,
+        latestNormalized: null,
+        latestPreview: null,
+        loadedPairId: isEditMode ? editPairId : null,
       };
 
       const colorPalette = [
@@ -261,6 +314,47 @@
         statusEl.className = `status ${kind}`;
       };
 
+      const setSaveStatus = (message, kind = "muted") => {
+        saveStatusEl.textContent = message;
+        saveStatusEl.className = `status ${kind}`;
+      };
+
+      const findCardByMarketId = (side, marketId) =>
+        state.cards[side].find((card) => card.marketId === marketId);
+
+      const collectMatchSelections = () => {
+        const byPair = new Map();
+        for (const side of ["kalshi", "polymarket"]) {
+          state.cards[side].forEach((card) => {
+            if (!card.matchedPairId) {
+              return;
+            }
+            if (!byPair.has(card.matchedPairId)) {
+              byPair.set(card.matchedPairId, {
+                relation_type: card.relationType || "same_direction",
+                active: card.matchActive !== false,
+              });
+            }
+            const entry = byPair.get(card.matchedPairId);
+            if (side === "kalshi") {
+              entry.kalshi_market_id = card.marketId;
+            } else {
+              entry.polymarket_market_id = card.marketId;
+            }
+          });
+        }
+
+        return [...byPair.values()].filter(
+          (entry) => entry.kalshi_market_id && entry.polymarket_market_id
+        );
+      };
+
+      const updateSaveButtonState = () => {
+        const hasPreview = !!state.latestPreview && !!state.latestNormalized;
+        const matches = collectMatchSelections();
+        saveButton.disabled = !hasPreview || (!isEditMode && matches.length === 0);
+      };
+
       const nextMatchColor = () => {
         const color = colorPalette[state.colorIndex % colorPalette.length];
         state.colorIndex += 1;
@@ -268,16 +362,6 @@
       };
 
       const getCard = (side, cardId) => state.cards[side].find((card) => card.id === cardId);
-
-      const getCardByPair = (pairId) => {
-        for (const side of ["kalshi", "polymarket"]) {
-          const found = state.cards[side].find((card) => card.matchedPairId === pairId);
-          if (found) {
-            return found;
-          }
-        }
-        return null;
-      };
 
       const resetMatchingState = () => {
         state.pending = null;
@@ -306,6 +390,8 @@
           dismissed: false,
           matchedPairId: null,
           matchColor: null,
+          matchActive: true,
+          relationType: "same_direction",
         };
       };
 
@@ -325,6 +411,20 @@
           createCard("polymarket", market, index)
         );
         resetMatchingState();
+      };
+
+      const applyMatchSelections = (matches) => {
+        matches.forEach((match) => {
+          const left = findCardByMarketId("kalshi", match.kalshi_market_id);
+          const right = findCardByMarketId("polymarket", match.polymarket_market_id);
+          if (!left || !right || left.matchedPairId || right.matchedPairId) {
+            return;
+          }
+          linkCards(left, right, {
+            active: match.active !== false,
+            relationType: match.relation_type || "same_direction",
+          });
+        });
       };
 
       const clearStacks = () => {
@@ -523,11 +623,23 @@
             if (card.matchedPairId === pairId) {
               card.matchedPairId = null;
               card.matchColor = null;
+              card.matchActive = true;
+              card.relationType = "same_direction";
             }
           });
         }
         if (!quiet) {
           setStatus("Match removed.", "muted");
+        }
+      };
+
+      const setMatchActive = (pairId, active) => {
+        for (const side of ["kalshi", "polymarket"]) {
+          state.cards[side].forEach((card) => {
+            if (card.matchedPairId === pairId) {
+              card.matchActive = !!active;
+            }
+          });
         }
       };
 
@@ -548,14 +660,20 @@
         setStatus("Card dismissed.", "muted");
       };
 
-      const linkCards = (first, second) => {
+      const linkCards = (first, second, options = {}) => {
         const pairId = `pair-${state.pairCounter}`;
         state.pairCounter += 1;
         const color = nextMatchColor();
+        const relationType = options.relationType || "same_direction";
+        const active = options.active !== false;
         first.matchedPairId = pairId;
         second.matchedPairId = pairId;
         first.matchColor = color;
         second.matchColor = color;
+        first.matchActive = active;
+        second.matchActive = active;
+        first.relationType = relationType;
+        second.relationType = relationType;
       };
 
       const beginOrCompleteMatch = (side, cardId) => {
@@ -632,6 +750,9 @@
         if (card.matchedPairId) {
           cardEl.classList.add("matched");
           cardEl.style.setProperty("--match-color", card.matchColor || "#7ce2a6");
+          if (!card.matchActive) {
+            cardEl.classList.add("dimmed");
+          }
         }
         if (isCardHighlightTarget(card)) {
           cardEl.classList.add("search-hit");
@@ -644,7 +765,10 @@
         const idMeta = document.createElement("p");
         idMeta.className = "meta";
         const yesPriceText = typeof card.yesPrice === "number" ? card.yesPrice.toFixed(3) : "n/a";
-        idMeta.textContent = `market_id: ${card.marketId} | YES price: ${yesPriceText}`;
+        const activeStatus = card.matchedPairId
+          ? ` | ${card.matchActive ? "Active" : "Inactive"}`
+          : "";
+        idMeta.textContent = `market_id: ${card.marketId} | YES price: ${yesPriceText}${activeStatus}`;
         cardEl.appendChild(idMeta);
 
         if (card.url) {
@@ -675,6 +799,20 @@
         actions.appendChild(dismissBtn);
 
         if (card.matchedPairId) {
+          const toggleActiveBtn = document.createElement("button");
+          toggleActiveBtn.type = "button";
+          toggleActiveBtn.className = "button-ghost";
+          toggleActiveBtn.textContent = card.matchActive ? "Deactivate" : "Activate";
+          toggleActiveBtn.addEventListener("click", () => {
+            setMatchActive(card.matchedPairId, !card.matchActive);
+            renderStacks();
+            setStatus(
+              card.matchActive ? "Match activated." : "Match deactivated.",
+              "muted"
+            );
+          });
+          actions.appendChild(toggleActiveBtn);
+
           const unmatchBtn = document.createElement("button");
           unmatchBtn.type = "button";
           unmatchBtn.className = "button-danger";
@@ -725,6 +863,84 @@
         clearStacks();
         renderSideStack("kalshi", kalshiStack);
         renderSideStack("polymarket", polymarketStack);
+        updateSaveButtonState();
+      };
+
+      const buildPreviewFromStoredPair = (pair) => ({
+        kalshi: {
+          entity_type: "event",
+          event: {
+            markets: (pair?.markets?.kalshi || []).map((market) => market.raw_snapshot || {}),
+          },
+        },
+        polymarket: {
+          entity_type: "event",
+          event: {
+            markets: (pair?.markets?.polymarket || []).map((market) => market.raw_snapshot || {}),
+          },
+        },
+      });
+
+      const buildMatchesFromOutcomeLinks = (outcomeLinks) => {
+        const grouped = new Map();
+        (outcomeLinks || []).forEach((link) => {
+          const key = [
+            link.kalshi_market_id,
+            link.polymarket_market_id,
+            link.relation_type || "same_direction",
+          ].join("|");
+          if (!grouped.has(key)) {
+            grouped.set(key, {
+              kalshi_market_id: link.kalshi_market_id,
+              polymarket_market_id: link.polymarket_market_id,
+              relation_type: link.relation_type || "same_direction",
+              active: !!link.active,
+            });
+          } else {
+            const existing = grouped.get(key);
+            existing.active = existing.active || !!link.active;
+          }
+        });
+        return [...grouped.values()];
+      };
+
+      const loadPairForEdit = async () => {
+        if (!isEditMode || !editPairId) {
+          return;
+        }
+        setStatus(`Loading pair #${editPairId}...`, "muted");
+        try {
+          const response = await fetch(`/api/pairs/${editPairId}`);
+          const payload = await response.json();
+          if (!payload.ok) {
+            setStatus(payload.error || "Failed to load pair.", "error");
+            return;
+          }
+
+          const pair = payload.pair;
+          const pairSet = pair.pair_set || {};
+          kalshiInput.value = pairSet.kalshi_url || "";
+          polymarketInput.value = pairSet.polymarket_url || "";
+          recurrenceIntentInput.value = pairSet.recurrence_intent || "";
+          expiresAtInput.value = pairSet.expires_at || "";
+
+          state.latestNormalized = {
+            kalshi: { lookup_value: pairSet.kalshi_lookup_value || null },
+            polymarket: { lookup_value: pairSet.polymarket_lookup_value || null },
+          };
+          state.latestPreview = buildPreviewFromStoredPair(pair);
+          loadCardsFromPreview(state.latestPreview);
+          applyMatchSelections(buildMatchesFromOutcomeLinks(pair.outcome_links));
+          clearHighlight();
+          renderStacks();
+          resultsEl.classList.remove("hidden");
+          setStatus(
+            `Loaded pair #${editPairId}. You can update URLs, matches, active flags, and expiration.`,
+            "ok"
+          );
+        } catch (error) {
+          setStatus(`Failed to load pair: ${error}`, "error");
+        }
       };
 
       form.addEventListener("submit", async (event) => {
@@ -732,6 +948,7 @@
         submitButton.disabled = true;
         resultsEl.classList.add("hidden");
         setStatus("Loading preview...", "muted");
+        setSaveStatus("", "muted");
 
         const kalshi_url = kalshiInput.value.trim();
         const polymarket_url = polymarketInput.value.trim();
@@ -745,9 +962,14 @@
           const payload = await response.json();
           if (!payload.ok) {
             setStatus(payload.error || "Preview failed.", "error");
+            state.latestPreview = null;
+            state.latestNormalized = null;
+            updateSaveButtonState();
             return;
           }
 
+          state.latestPreview = payload.preview;
+          state.latestNormalized = payload.normalized;
           loadCardsFromPreview(payload.preview);
           clearHighlight();
           renderStacks();
@@ -760,7 +982,61 @@
         }
       });
 
+      saveButton.addEventListener("click", async () => {
+        const matches = collectMatchSelections();
+        if (!state.latestPreview || !state.latestNormalized) {
+          setSaveStatus("Load a preview before saving.", "error");
+          return;
+        }
+        if (!isEditMode && !matches.length) {
+          setSaveStatus("Create at least one match before saving.", "error");
+          return;
+        }
+
+        saveButton.disabled = true;
+        setSaveStatus(isEditMode ? "Updating pair..." : "Saving pair...", "muted");
+        const payload = {
+          kalshi_url: kalshiInput.value.trim(),
+          polymarket_url: polymarketInput.value.trim(),
+          normalized: state.latestNormalized,
+          preview: state.latestPreview,
+          matches,
+          recurrence_intent: recurrenceIntentInput.value || null,
+          expires_at: expiresAtInput.value || null,
+        };
+
+        const endpoint = isEditMode ? `/api/pairs/${editPairId}` : "/api/pairs";
+        const method = isEditMode ? "PUT" : "POST";
+        try {
+          const response = await fetch(endpoint, {
+            method,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const data = await response.json();
+          if (!data.ok) {
+            setSaveStatus(data.error || "Save failed.", "error");
+            return;
+          }
+
+          const action = isEditMode ? "Updated" : "Saved";
+          setSaveStatus(
+            `${action} pair #${data.pair_id} (${data.saved_link_rows} outcome link rows).`,
+            "ok"
+          );
+        } catch (error) {
+          setSaveStatus(`Save request failed: ${error}`, "error");
+        } finally {
+          updateSaveButtonState();
+        }
+      });
+
       window.addEventListener("DOMContentLoaded", () => {
+        updateSaveButtonState();
+        if (isEditMode) {
+          loadPairForEdit();
+          return;
+        }
         if (kalshiInput.value.trim() && polymarketInput.value.trim()) {
           form.requestSubmit();
         }

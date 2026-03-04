@@ -101,3 +101,26 @@ Use this file to keep a running record of what we learn about the repo and excha
   - Expansion now includes related market families for the same matchup key (winner, spread, total, team totals, and player props when available).
   - Added adapter tests in `tests/test_pmxt_adapter.py` for expansion behavior, including exclusion of unrelated matchup markets.
   - Verification: `make test` passed (11 tests); live preview for NBA sample now shows Kalshi `event.markets=221` with spread/total/player props present.
+- 2026-03-04 23:15 EST (todo list reset)
+  - Cleared legacy PMXT bootstrap checklist from `TODO.md`.
+  - Set a single active TODO item: add optional recurrence intent at pair level (one-off, daily, weekly, rolling-next).
+- 2026-03-04 23:46 EST (phase 5 persistence + save/load APIs)
+  - Added migration-backed persistence schema in `app/db.py`: `pair_sets`, `pair_markets`, `pair_outcome_links`.
+  - Implemented transactional save/load helpers with recurrence and expiration support (`save_pair_set`, `load_pair_set`).
+  - Added API endpoints in `app/main.py`: `POST /api/pairs` and `GET /api/pairs/{pair_id}`.
+  - Updated `templates/index.html` with recurrence/date controls and `Save Pair` action, including client-side match extraction and save status feedback.
+  - Added persistence tests in `tests/test_pair_persistence.py` for same-direction and inverse outcome-link generation.
+  - Marked Phase 5 completed in the implementation plan.
+  - Verification: `make test` passed (13 tests); live save/reload flow succeeded (`pair_id=1`, recurrence persisted, 14 Kalshi + 32 Polymarket markets, 2 outcome links).
+- 2026-03-04 15:54 EST (phase 6 view/edit + CRUD for pairs)
+  - Added Phase 6 backend persistence APIs in `app/db.py`: `list_pair_sets`, `update_pair_set`, and `delete_pair_set`, plus reusable market/link persistence helpers.
+  - Extended outcome-link persistence to carry match `active` state from UI selections.
+  - Added FastAPI routes in `app/main.py`:
+    - UI: `GET /pairs`, `GET /pairs/{pair_id}/edit`
+    - API: `GET /api/pairs?status=all|active|expired`, `PUT /api/pairs/{pair_id}`, `DELETE /api/pairs/{pair_id}`
+  - Added `templates/pairs.html` list/manage page with status filter, edit links, and delete actions.
+  - Updated `templates/index.html` to support edit mode (load saved pair, modify mappings, toggle active/inactive matches, and update existing pair).
+  - Added/expanded persistence tests in `tests/test_pair_persistence.py` for update flow, list filtering, and delete behavior.
+  - Marked Phase 6 complete in the implementation plan.
+  - Verification: `make test` passed (16 tests).
+  - Open risk: edit mode currently reconstructs preview from saved snapshots; if a pair was saved with incomplete snapshots, an explicit re-fetch via URL preview is still needed before update.
