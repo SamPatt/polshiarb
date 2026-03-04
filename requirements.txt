@@ -1,0 +1,8 @@
+# Pinned Python environment baseline for Polshiarb (Phase 0)
+# Install with: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+
+pmxt==2.18.1
+urllib3==2.2.3
+python-dateutil==2.9.0.post0
+pydantic==2.11.7
+typing-extensions==4.12.2
