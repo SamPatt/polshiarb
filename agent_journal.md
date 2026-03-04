@@ -58,3 +58,14 @@ Use this file to keep a running record of what we learn about the repo and excha
   - Added `pytest` to `requirements.txt` and marked Phase 2 completed in the plan file.
   - Verification: `make test` passed (7 tests). Normalization endpoint returns expected ticker/slug for sample URLs.
   - Open risk: endpoint currently returns `{ok:false,...}` with HTTP 200 on validation failures; Phase 3 can move this to explicit 4xx response modeling.
+- 2026-03-04 10:21 EST (recurrence ownership decision)
+  - Updated implementation plan to clarify recurrence/date handling ownership.
+  - URL normalization stays deterministic (URL -> identifiers only); recurrence instance selection is app-domain logic, not PMXT logic.
+  - Added recurrence intent/config notes to Phase 4 (UI) and Phase 5 (persistence).
+- 2026-03-04 10:40 EST (phase 3 PMXT adapter + preview endpoint)
+  - Added `app/pmxt_adapter.py` with `PMXTAdapter` to fetch/normalize Kalshi market and Polymarket event details from Phase 2 normalized lookups.
+  - Added `POST /api/preview` in `app/main.py` to normalize input URLs and fetch PMXT-backed preview payloads.
+  - Added adapter unit test file `tests/test_pmxt_adapter.py` with stub clients to validate normalization shape without live network.
+  - Marked Phase 3 complete in the implementation plan.
+  - Verification: `make test` passed (8 tests) and live `/api/preview` returned `ok=true` with Kalshi market + Polymarket event (32 markets).
+  - Open risk: Polymarket event URLs can map to many markets; Phase 4 UI will need explicit market selection/matching UX.

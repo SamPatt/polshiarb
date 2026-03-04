@@ -25,10 +25,11 @@
 3. **Phase 2: URL parsing + normalization layer (Completed on 2026-03-04)**
 - Build parser functions for Kalshi and Polymarket URLs.
 - Extract canonical identifiers (`slug`, `market_id`, or event reference).
+- Keep parser scope deterministic (URL -> identifiers); do not resolve recurring/date-specific instances here.
 - Return structured parse results and validation errors for malformed URLs.
 - Deliverable: unit tests for URL parser with real URL samples.
 
-4. **Phase 3: Market fetch adapter layer**
+4. **Phase 3: Market fetch adapter layer (Completed on 2026-03-04)**
 - Implement `ExchangeAdapter` interface with `PMXTAdapter` first.
 - Add resolution-rule field extraction strategy:
   - primary: PMXT unified market/event fields
@@ -46,6 +47,7 @@
 - Add mapping controls to link outcomes:
   - link type: `same_direction` or `inverse`
   - allow multiple mappings per pair set.
+- Add optional recurrence intent at pair level (e.g., one-off, daily, weekly, rolling-next).
 - Deliverable: user can create mappings in the browser without manual IDs.
 
 6. **Phase 5: Persistence model + save flow**
@@ -53,6 +55,9 @@
   - `pair_sets` (pair metadata, URLs, expiration, timestamps)
   - `pair_markets` (normalized market snapshots)
   - `pair_outcome_links` (outcome-to-outcome mappings, relation type, active flag)
+- Recurrence ownership:
+  - Store recurrence config in app-owned fields (intent, timezone, optional date rule).
+  - PMXT remains a data/trading layer only; it should not decide recurrence/instance selection policy.
 - Save action writes all selected mappings atomically in one transaction.
 - Deliverable: saved pair survives restart and can be queried by ID.
 
