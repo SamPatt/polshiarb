@@ -83,7 +83,7 @@
   - exchange, market IDs, outcome IDs, relation type, expiration.
 - Deliverable: stable contract for your monitoring process.
 
-10. **Phase 9: Testing + hardening**
+10. **Phase 9: Testing + hardening (Completed on 2026-03-04)**
 - Unit tests: URL parsing, normalization, expiration logic.
 - Integration tests: save/edit/list flows with test DB.
 - Contract test: monitoring endpoint payload shape.

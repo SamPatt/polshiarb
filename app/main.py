@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import logging
 from typing import Any, Literal
 
 from fastapi import FastAPI, Query, Request
@@ -21,8 +22,19 @@ from app.db import (
 from app.pmxt_adapter import PMXTAdapter, PMXTAdapterError
 from app.url_normalization import URLNormalizationError, normalize_pair_urls
 
+
+def _configure_logging() -> None:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
+
+
+_configure_logging()
 app = FastAPI(title="Polshiarb Pair Manager")
 templates = Jinja2Templates(directory="templates")
+logger = logging.getLogger("polshiarb.api")
 
 
 class NormalizePairRequest(BaseModel):
@@ -56,6 +68,8 @@ class PairListResponse(BaseModel):
     ok: bool
     pairs: list[dict[str, Any]] = Field(default_factory=list)
     status: str = "all"
+    error: str | None = None
+    error_code: str | None = None
 
 
 class MonitoringLeg(BaseModel):
@@ -81,6 +95,20 @@ class MonitoringPairsResponse(BaseModel):
     pairs: list[MonitoringPair] = Field(default_factory=list)
     active_only: bool = True
     include_expired: bool = False
+    error: str | None = None
+    error_code: str | None = None
+
+
+def _error_response(
+    *,
+    message: str,
+    error_code: str,
+    details: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {"ok": False, "error": message, "error_code": error_code}
+    if details:
+        payload.update(details)
+    return payload
 
 
 @lru_cache(maxsize=1)
@@ -144,7 +172,16 @@ def normalize_pair(payload: NormalizePairRequest) -> dict[str, object]:
         )
         return {"ok": True, "normalized": normalized}
     except URLNormalizationError as exc:
-        return {"ok": False, "error": str(exc)}
+        logger.warning(
+            "normalize_pair validation failed error_code=INVALID_URL kalshi_url=%s polymarket_url=%s error=%s",
+            payload.kalshi_url,
+            payload.polymarket_url,
+            str(exc),
+        )
+        return _error_response(
+            message=str(exc),
+            error_code="INVALID_URL",
+        )
 
 
 @app.post("/api/preview")
@@ -155,12 +192,27 @@ def preview_pair(payload: PreviewPairRequest) -> dict[str, object]:
             polymarket_url=payload.polymarket_url,
         )
     except URLNormalizationError as exc:
-        return {"ok": False, "error": str(exc)}
+        logger.warning(
+            "preview_pair validation failed error_code=INVALID_URL kalshi_url=%s polymarket_url=%s error=%s",
+            payload.kalshi_url,
+            payload.polymarket_url,
+            str(exc),
+        )
+        return _error_response(message=str(exc), error_code="INVALID_URL")
 
     try:
         preview = get_pmxt_adapter().preview_from_normalized(normalized)
     except PMXTAdapterError as exc:
-        return {"ok": False, "error": str(exc), "normalized": normalized}
+        logger.exception(
+            "preview_pair PMXT fetch failed error_code=PMXT_PREVIEW_FAILED kalshi_lookup=%s polymarket_lookup=%s",
+            (normalized.get("kalshi") or {}).get("lookup_value"),
+            (normalized.get("polymarket") or {}).get("lookup_value"),
+        )
+        return _error_response(
+            message=f"Preview fetch failed via PMXT: {exc}",
+            error_code="PMXT_PREVIEW_FAILED",
+            details={"normalized": normalized},
+        )
 
     return {"ok": True, "normalized": normalized, "preview": preview}
 
@@ -181,7 +233,15 @@ def create_pair(payload: SavePairRequest) -> dict[str, object]:
             },
         )
     except Exception as exc:
-        return {"ok": False, "error": f"Failed to save pair: {exc}"}
+        logger.exception(
+            "create_pair failed error_code=PAIR_SAVE_FAILED kalshi_url=%s polymarket_url=%s",
+            payload.kalshi_url,
+            payload.polymarket_url,
+        )
+        return _error_response(
+            message=f"Failed to save pair: {exc}",
+            error_code="PAIR_SAVE_FAILED",
+        )
 
     return {"ok": True, **save_result}
 
@@ -189,7 +249,16 @@ def create_pair(payload: SavePairRequest) -> dict[str, object]:
 @app.get("/api/pairs")
 def list_pairs(status: str = Query(default="all")) -> PairListResponse:
     if status not in {"all", "active", "expired"}:
-        return PairListResponse(ok=False, status=status)
+        logger.warning(
+            "list_pairs invalid status filter error_code=INVALID_STATUS_FILTER status=%s",
+            status,
+        )
+        return PairListResponse(
+            ok=False,
+            status=status,
+            error=f"Invalid status filter: {status}. Expected one of all|active|expired.",
+            error_code="INVALID_STATUS_FILTER",
+        )
     pairs = list_pair_sets(DEFAULT_DB_PATH, status=status)
     return PairListResponse(ok=True, pairs=pairs, status=status)
 
@@ -198,7 +267,11 @@ def list_pairs(status: str = Query(default="all")) -> PairListResponse:
 def get_pair(pair_id: int) -> dict[str, object]:
     pair = load_pair_set(DEFAULT_DB_PATH, pair_id)
     if pair is None:
-        return {"ok": False, "error": f"Pair {pair_id} not found"}
+        logger.info("get_pair not found error_code=PAIR_NOT_FOUND pair_id=%s", pair_id)
+        return _error_response(
+            message=f"Pair {pair_id} not found",
+            error_code="PAIR_NOT_FOUND",
+        )
     return {"ok": True, "pair": pair}
 
 
@@ -219,10 +292,23 @@ def put_pair(pair_id: int, payload: SavePairRequest) -> dict[str, object]:
             },
         )
     except Exception as exc:
-        return {"ok": False, "error": f"Failed to update pair: {exc}"}
+        logger.exception(
+            "put_pair failed error_code=PAIR_UPDATE_FAILED pair_id=%s kalshi_url=%s polymarket_url=%s",
+            pair_id,
+            payload.kalshi_url,
+            payload.polymarket_url,
+        )
+        return _error_response(
+            message=f"Failed to update pair: {exc}",
+            error_code="PAIR_UPDATE_FAILED",
+        )
 
     if update_result is None:
-        return {"ok": False, "error": f"Pair {pair_id} not found"}
+        logger.info("put_pair not found error_code=PAIR_NOT_FOUND pair_id=%s", pair_id)
+        return _error_response(
+            message=f"Pair {pair_id} not found",
+            error_code="PAIR_NOT_FOUND",
+        )
     return {"ok": True, **update_result}
 
 
@@ -230,7 +316,11 @@ def put_pair(pair_id: int, payload: SavePairRequest) -> dict[str, object]:
 def remove_pair(pair_id: int) -> dict[str, object]:
     deleted = delete_pair_set(DEFAULT_DB_PATH, pair_id)
     if not deleted:
-        return {"ok": False, "error": f"Pair {pair_id} not found"}
+        logger.info("remove_pair not found error_code=PAIR_NOT_FOUND pair_id=%s", pair_id)
+        return _error_response(
+            message=f"Pair {pair_id} not found",
+            error_code="PAIR_NOT_FOUND",
+        )
     return {"ok": True, "pair_id": pair_id}
 
 
@@ -239,11 +329,25 @@ def get_monitoring_pairs(
     active_only: bool = Query(default=True),
     include_expired: bool = Query(default=False),
 ) -> MonitoringPairsResponse:
-    links = list_monitoring_links(
-        db_path=DEFAULT_DB_PATH,
-        active_only=active_only,
-        include_expired=include_expired,
-    )
+    try:
+        links = list_monitoring_links(
+            db_path=DEFAULT_DB_PATH,
+            active_only=active_only,
+            include_expired=include_expired,
+        )
+    except Exception as exc:
+        logger.exception(
+            "get_monitoring_pairs failed error_code=MONITORING_QUERY_FAILED active_only=%s include_expired=%s",
+            active_only,
+            include_expired,
+        )
+        return MonitoringPairsResponse(
+            ok=False,
+            active_only=active_only,
+            include_expired=include_expired,
+            error=f"Failed to load monitoring pairs: {exc}",
+            error_code="MONITORING_QUERY_FAILED",
+        )
 
     grouped_pairs: dict[int, MonitoringPair] = {}
     for link in links:

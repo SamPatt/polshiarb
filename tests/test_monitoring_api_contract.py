@@ -91,7 +91,16 @@ def test_monitoring_pairs_contract_default_filters(tmp_path: Path, monkeypatch) 
     assert payload["ok"] is True
     assert payload["active_only"] is True
     assert payload["include_expired"] is False
-    assert set(payload.keys()) == {"ok", "pairs", "active_only", "include_expired"}
+    assert set(payload.keys()) == {
+        "ok",
+        "pairs",
+        "active_only",
+        "include_expired",
+        "error",
+        "error_code",
+    }
+    assert payload["error"] is None
+    assert payload["error_code"] is None
 
     # One non-expired active pair remains; each match creates YES/NO mappings.
     assert len(payload["pairs"]) == 1

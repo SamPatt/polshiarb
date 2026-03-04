@@ -70,7 +70,17 @@ Base URL (local):
 
 General notes:
 - Request/response format is JSON unless noted.
-- Most endpoints currently return HTTP `200` with `{"ok": false, "error": "..."}` for validation/runtime failures.
+- Most endpoints currently return HTTP `200` with a predictable error payload for validation/runtime failures:
+  - `{"ok": false, "error": "...", "error_code": "..."}`.
+
+Common `error_code` values:
+- `INVALID_URL`
+- `INVALID_STATUS_FILTER`
+- `PMXT_PREVIEW_FAILED`
+- `PAIR_SAVE_FAILED`
+- `PAIR_UPDATE_FAILED`
+- `PAIR_NOT_FOUND`
+- `MONITORING_QUERY_FAILED`
 
 ### `GET /healthz`
 
@@ -187,6 +197,8 @@ Response shape (stable contract):
   "ok": true,
   "active_only": true,
   "include_expired": false,
+  "error": null,
+  "error_code": null,
   "pairs": [
     {
       "pair_id": 12,

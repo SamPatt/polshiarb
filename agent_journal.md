@@ -146,3 +146,12 @@ Use this file to keep a running record of what we learn about the repo and excha
   - Expanded README with a full API reference: normalize, preview, pair CRUD/list/load/update/delete, and monitoring endpoint contract.
   - Added concrete request/response examples and behavior notes for monitoring mappings.
   - Verification: `make test` passed (19 tests).
+- 2026-03-04 16:15 EST (phase 9 testing + hardening)
+  - Added structured API logging setup in `app/main.py` plus consistent `error_code` responses across normalize/preview/pair CRUD/monitoring endpoints.
+  - Hardened PMXT preview failure handling with explicit error code (`PMXT_PREVIEW_FAILED`) and clearer user-facing message.
+  - Added API-level integration test suite in `tests/test_api_integration_flows.py` covering save/list/get/update/delete flow on a temp DB and predictable error paths.
+  - Updated monitoring contract tests for optional `error`/`error_code` fields.
+  - Expanded README API docs with standardized error payload format and common error code list.
+  - Marked Phase 9 complete in the implementation plan.
+  - Verification: `make test` passed (22 tests).
+  - Open risk: endpoints still use HTTP 200 for handled failures; if strict HTTP semantics are required, migrate to `HTTPException`/status codes in a follow-up.
