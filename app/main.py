@@ -111,6 +111,17 @@ def _error_response(
     return payload
 
 
+def _is_pmxt_sidecar_auth_error(exc: PMXTAdapterError) -> bool:
+    message = str(exc).lower()
+    return "unauthorized" in message and "access token" in message
+
+
+def _clear_pmxt_adapter_cache() -> None:
+    cache_clear = getattr(get_pmxt_adapter, "cache_clear", None)
+    if callable(cache_clear):
+        cache_clear()
+
+
 @lru_cache(maxsize=1)
 def get_pmxt_adapter() -> PMXTAdapter:
     return PMXTAdapter()
@@ -203,6 +214,17 @@ def preview_pair(payload: PreviewPairRequest) -> dict[str, object]:
     try:
         preview = get_pmxt_adapter().preview_from_normalized(normalized)
     except PMXTAdapterError as exc:
+        if _is_pmxt_sidecar_auth_error(exc):
+            logger.warning(
+                "preview_pair detected PMXT sidecar auth mismatch; refreshing adapter and retrying "
+                "error_code=PMXT_ACCESS_TOKEN_MISMATCH"
+            )
+            _clear_pmxt_adapter_cache()
+            try:
+                preview = get_pmxt_adapter().preview_from_normalized(normalized)
+                return {"ok": True, "normalized": normalized, "preview": preview}
+            except PMXTAdapterError as retry_exc:
+                exc = retry_exc
         logger.exception(
             "preview_pair PMXT fetch failed error_code=PMXT_PREVIEW_FAILED kalshi_lookup=%s polymarket_lookup=%s",
             (normalized.get("kalshi") or {}).get("lookup_value"),

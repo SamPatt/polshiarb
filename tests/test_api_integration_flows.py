@@ -146,3 +146,37 @@ def test_preview_pmxt_failure_returns_predictable_error(monkeypatch) -> None:
     assert response["ok"] is False
     assert response["error_code"] == "PMXT_PREVIEW_FAILED"
     assert "Preview fetch failed via PMXT" in response["error"]
+
+
+def test_preview_retries_once_on_pmxt_access_token_mismatch(monkeypatch) -> None:
+    class TokenErrorAdapter:
+        def preview_from_normalized(self, normalized):  # noqa: ANN001
+            raise PMXTAdapterError(
+                "Kalshi fetch failed: Failed to fetch market: Unauthorized: Invalid or missing access token"
+            )
+
+    class SuccessAdapter:
+        def preview_from_normalized(self, normalized):  # noqa: ANN001
+            return {
+                "kalshi": {"entity_type": "market", "lookup": normalized["kalshi"]},
+                "polymarket": {"entity_type": "event", "lookup": normalized["polymarket"]},
+            }
+
+    calls = {"count": 0}
+
+    def get_adapter():  # noqa: ANN202
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return TokenErrorAdapter()
+        return SuccessAdapter()
+
+    monkeypatch.setattr(main_module, "get_pmxt_adapter", get_adapter)
+    payload = PreviewPairRequest(
+        kalshi_url="https://kalshi.com/markets/kxsenateild/ild/kxsenateild-26",
+        polymarket_url="https://polymarket.com/event/illinois-democratic-senate-primary-winner",
+    )
+    response = main_module.preview_pair(payload=payload)
+
+    assert response["ok"] is True
+    assert calls["count"] == 2
+    assert response["preview"]["kalshi"]["entity_type"] == "market"

@@ -106,6 +106,17 @@ def _parse_args() -> argparse.Namespace:
         help="Emit periodic debug heartbeat every N seconds when --debug is enabled.",
     )
     parser.add_argument(
+        "--compact-alerts",
+        action="store_true",
+        help="Emit single-line alerts only (disable pretty multi-line formatting).",
+    )
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="Terminal color mode for pretty alerts (default: auto).",
+    )
+    parser.add_argument(
         "--skip-pmxt-sidecar-restart",
         action="store_true",
         help=(
@@ -190,6 +201,8 @@ class ArbAlertRunner:
         self._worker_threads: dict[tuple[str, str], threading.Thread] = {}
         self._kalshi_direct_kwargs = build_kalshi_client_kwargs()
         self._use_kalshi_sidecar_default = True
+        self._compact_alerts = bool(getattr(args, "compact_alerts", False))
+        self._use_color = self._should_use_color(getattr(args, "color", "auto"))
 
     def _print_line(self, line: str) -> None:
         with self._print_lock:
@@ -444,6 +457,97 @@ class ArbAlertRunner:
         for exchange in exchanges:
             self._close_exchange_client(exchange)
 
+    def _should_use_color(self, mode: str) -> bool:
+        normalized = (mode or "auto").lower()
+        if normalized == "always":
+            return True
+        if normalized == "never":
+            return False
+        if os.getenv("NO_COLOR"):
+            return False
+        return bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+    def _colorize(self, value: str, code: str) -> str:
+        if not self._use_color:
+            return value
+        return f"\033[{code}m{value}\033[0m"
+
+    def _tag_accent(self, tag: str) -> str:
+        if tag == "ALERT_ARB_CROSS":
+            return self._colorize("cross-market set edge", "1;32")
+        if tag == "ALERT_ARB_WITHIN":
+            return self._colorize("within-market set edge", "1;36")
+        return self._colorize("cross-market deviation", "1;33")
+
+    def _metric_summary(self, event: Any) -> tuple[str, str]:
+        if event.metric_name == "cross_market_set_1":
+            return (
+                "Buy Kalshi P ask + Polymarket NOT_P ask",
+                f"Kalshi P ask={event.details.get('kalshi_p_ask', 'na')} | "
+                f"Polymarket NOT_P ask={event.details.get('polymarket_not_p_ask', 'na')}",
+            )
+        if event.metric_name == "cross_market_set_2":
+            return (
+                "Buy Polymarket P ask + Kalshi NOT_P ask",
+                f"Polymarket P ask={event.details.get('polymarket_p_ask', 'na')} | "
+                f"Kalshi NOT_P ask={event.details.get('kalshi_not_p_ask', 'na')}",
+            )
+        if event.metric_name == "within_kalshi":
+            return (
+                "Buy both sides on Kalshi",
+                f"Kalshi P ask={event.details.get('kalshi_p_ask', 'na')} | "
+                f"Kalshi NOT_P ask={event.details.get('kalshi_not_p_ask', 'na')}",
+            )
+        if event.metric_name == "within_polymarket":
+            return (
+                "Buy both sides on Polymarket",
+                f"Polymarket P ask={event.details.get('polymarket_p_ask', 'na')} | "
+                f"Polymarket NOT_P ask={event.details.get('polymarket_not_p_ask', 'na')}",
+            )
+        if event.metric_name == "same_token_gap_p":
+            return (
+                "Same token P ask-price gap across markets",
+                f"Kalshi P ask={event.details.get('kalshi_p_ask', 'na')} | "
+                f"Polymarket P ask={event.details.get('polymarket_p_ask', 'na')}",
+            )
+        if event.metric_name == "same_token_gap_not_p":
+            return (
+                "Same token NOT_P ask-price gap across markets",
+                f"Kalshi NOT_P ask={event.details.get('kalshi_not_p_ask', 'na')} | "
+                f"Polymarket NOT_P ask={event.details.get('polymarket_not_p_ask', 'na')}",
+            )
+        return ("Opportunity detected", "Quote legs unavailable")
+
+    def _format_alert_block(self, event: Any, *, emitted_at: datetime) -> str:
+        if self._compact_alerts:
+            return format_alert_line(event, emitted_at=emitted_at)
+
+        summary, legs = self._metric_summary(event)
+        value = self._colorize(f"{event.metric_value:.4f}", "1;32")
+        threshold = self._colorize(f"{event.threshold:.4f}", "1;37")
+        markets = (
+            f"Kalshi={event.kalshi_market_id} | "
+            f"Polymarket={event.polymarket_market_id}"
+        )
+        metric = self._colorize(event.metric_name, "35")
+        relation = self._colorize(event.relation_type, "36")
+        divider = self._colorize("-" * 96, "2")
+
+        return "\n".join(
+            [
+                (
+                    f"[{event.tag}] ts={emitted_at.isoformat()} pair_id={event.pair_id} "
+                    f"{self._tag_accent(event.tag)}"
+                ),
+                f"  What: {summary}",
+                f"  Metric: {metric} | value={value} threshold={threshold} | relation={relation}",
+                f"  Markets: {self._colorize(markets, '2')}",
+                f"  Legs: {legs}",
+                "  Note: Informational top-of-book signal only (fees, depth, and execution risk excluded).",
+                divider,
+            ]
+        )
+
     def _worker(
         self,
         *,
@@ -572,6 +676,7 @@ class ArbAlertRunner:
 
     def _evaluate_and_emit(self) -> None:
         now = time.time()
+        emitted_at = datetime.fromtimestamp(now, tz=timezone.utc)
         with self._state_lock:
             events = evaluate_all_mappings(
                 self._mappings,
@@ -591,12 +696,7 @@ class ArbAlertRunner:
                     last_emitted_at_by_key=self._last_emitted_at,
                 ):
                     continue
-                lines.append(
-                    format_alert_line(
-                        event,
-                        emitted_at=datetime.fromtimestamp(now, tz=timezone.utc),
-                    )
-                )
+                lines.append(self._format_alert_block(event, emitted_at=emitted_at))
 
         for line in lines:
             self._print_line(line)
