@@ -82,6 +82,40 @@ Notes:
 - Add `--include-inactive` and/or `--include-expired` to widen selection.
 - Kalshi streaming requires auth; this repo supports `KALSHI_API_KEY` plus `KALSHI_PRIVATE_KEY=./key.pem`.
 
+### Continuous WS arb alert runner (API-driven)
+
+Run the API server first (pair discovery source), then run the continuous alert watcher:
+
+```bash
+make run-web
+```
+
+```bash
+make run-arb-alerts
+```
+
+Direct script usage with explicit thresholds:
+
+```bash
+.venv/bin/python scripts/ws_arb_alerts.py \
+  --api-base-url http://127.0.0.1:8011 \
+  --arb-threshold 0.02 \
+  --deviation-threshold 0.03
+```
+
+What it alerts on:
+- `[ALERT_ARB_CROSS]`: `1 - (YES_ask + NO_ask)` across markets, both directions.
+- `[ALERT_ARB_WITHIN]`: `1 - (YES_ask + NO_ask)` within Kalshi and within Polymarket.
+- `[ALERT_DEVIATION]`: `abs(ask_kalshi - ask_polymarket)` for the same semantic token (`P` and `not_P`).
+
+Example threshold trigger:
+- If `YES_ask = 0.60` and `NO_ask = 0.38`, edge = `1 - (0.60 + 0.38) = 0.02`, so it alerts at default `--arb-threshold 0.02`.
+
+Notes:
+- Uses active, non-expired mappings by default (`--include-inactive` / `--include-expired` are debug overrides).
+- Uses top-of-book asks only in v1 (no depth simulation, fees, or slippage).
+- Uses per-opportunity cooldown (`--cooldown-seconds`, default `30`) and staleness filtering (`--book-stale-seconds`, default `15`).
+
 ## API reference
 
 Base URL (local):

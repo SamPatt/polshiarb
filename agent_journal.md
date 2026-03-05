@@ -162,3 +162,20 @@ Use this file to keep a running record of what we learn about the repo and excha
   - Updated tests in `tests/test_pair_persistence.py` and `tests/test_monitoring_api_contract.py` to assert latest-wins behavior.
   - Added README note documenting the dedupe policy.
   - Verification: `make test` passed (22 tests).
+- 2026-03-04 21:20 EST (continuous WS arb alert runner, PMXT-first)
+  - Added reusable arb evaluation module in `app/arb_alerts.py` with:
+    - monitoring-row normalization and semantic mapping construction (`P` / `not_P`) from saved pair snapshots,
+    - top-of-book alert formulas for cross-market, within-market, and same-token deviation checks,
+    - staleness filtering and cooldown gating helpers,
+    - deterministic alert-line formatting.
+  - Added `scripts/ws_arb_alerts.py`:
+    - loads mappings from `GET /api/monitoring/pairs` and pair detail side metadata from `GET /api/pairs/{pair_id}`,
+    - runs one WS worker per unique `(exchange, outcome_id)` via PMXT,
+    - refreshes mappings periodically and restarts workers when stream sets change,
+    - emits grep-friendly tags: `[ALERT_ARB_CROSS]`, `[ALERT_ARB_WITHIN]`, `[ALERT_DEVIATION]`.
+  - Added `make run-arb-alerts` target in `Makefile`.
+  - Updated `README.md` with usage, thresholds, tags, and the `0.60 + 0.38 => 0.02` trigger example.
+  - Added tests:
+    - `tests/test_arb_alerts.py` for mapping normalization, formula thresholds, staleness, cooldown, and missing-ask behavior.
+    - `tests/test_ws_arb_alerts_script.py` integration-style runner test with mocked API and mocked PMXT orderbooks verifying all three alert tags are emitted.
+  - Verification: `.venv/bin/python -m pytest -q` passed (35 tests).
