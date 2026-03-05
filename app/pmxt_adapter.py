@@ -5,6 +5,7 @@ import re
 from typing import Any, Protocol
 
 import pmxt
+from app.kalshi_credentials import build_kalshi_client_kwargs
 
 
 class PMXTAdapterError(RuntimeError):
@@ -89,7 +90,7 @@ def _normalize_event(raw_event: dict[str, Any] | Any) -> dict[str, Any]:
 class PMXTAdapter:
     def __init__(self, polymarket_client: Any | None = None, kalshi_client: Any | None = None) -> None:
         self.polymarket = polymarket_client or pmxt.Polymarket()
-        self.kalshi = kalshi_client or pmxt.Kalshi()
+        self.kalshi = kalshi_client or pmxt.Kalshi(**build_kalshi_client_kwargs())
         self._kalshi_matchup_cache: dict[str, list[dict[str, Any]]] = {}
 
     def preview_from_normalized(

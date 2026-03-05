@@ -1,0 +1,6 @@
+[info] Starting 4 stream(s) from data/pair_manager.db (active_only=True, include_expired=False, updates_per_stream=1, depth=None)
+[kalshi] outcome=KXSENATEILD-26-JSTR pairs=[1] markets=['KXSENATEILD-26-JSTR'] ts=2026-03-05T01:50:36.482000+00:00 best_bid=0.53 x 29.0 best_ask=0.54 x 68.0 spread=0.010000000000000009
+[kalshi] outcome=KXSENATEILD-26-JSTR-NO pairs=[1] markets=['KXSENATEILD-26-JSTR'] ts=2026-03-05T01:50:36.483000+00:00 best_bid=0.53 x 29.0 best_ask=0.54 x 68.0 spread=0.010000000000000009
+[polymarket] outcome=72561895264279188709235737099713054369227860880214680846201829478053002120402 pairs=[1] markets=['679268'] ts=2026-03-05T01:50:35.944000+00:00 best_bid=0.45 x 46.37 best_ask=0.47 x 70.01 spread=0.019999999999999962
+[polymarket] outcome=77089564443108788382233212301997998496655453493992505627581701048596754175114 pairs=[1] markets=['679268'] ts=2026-03-05T01:50:35.944000+00:00 best_bid=0.53 x 70.01 best_ask=0.55 x 46.37 spread=0.020000000000000018
+[info] Smoke run complete.

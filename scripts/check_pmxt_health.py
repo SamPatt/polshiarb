@@ -5,9 +5,16 @@ from __future__ import annotations
 
 import sys
 import traceback
+from pathlib import Path
 
 import pmxt
 import urllib3
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from app.kalshi_credentials import build_kalshi_client_kwargs
 
 
 def _check_exchange(name: str, exchange: object) -> bool:
@@ -29,7 +36,7 @@ def main() -> int:
 
     checks = [
         _check_exchange("polymarket", pmxt.Polymarket()),
-        _check_exchange("kalshi", pmxt.Kalshi()),
+        _check_exchange("kalshi", pmxt.Kalshi(**build_kalshi_client_kwargs())),
     ]
     return 0 if all(checks) else 1
 

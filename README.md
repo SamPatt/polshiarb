@@ -21,7 +21,13 @@ The core contract remains:
 - For outcome-level calls (orderbook/trades/ohlcv), use `outcome_id`.
 - For setup/sanity steps (startup path, health checks, caveats), see the TODO task list.
 
-The full Python SDK API reference is in [`PMXT_PYTHON_API_REFERENCE.md`](./PMXT_PYTHON_API_REFERENCE.md).
+The full Python SDK API reference is in [`docs/PMXT_PYTHON_API_REFERENCE.md`](./docs/PMXT_PYTHON_API_REFERENCE.md).
+
+## Docs
+
+- [`docs/README.md`](./docs/README.md)
+- [`docs/orderbooks-kalshi-polymarket.md`](./docs/orderbooks-kalshi-polymarket.md)
+- [`docs/auth/README.md`](./docs/auth/README.md)
 
 ## Local setup and run
 
@@ -62,6 +68,19 @@ Default URL:
 
 Health endpoint:
 - `http://127.0.0.1:8011/healthz`
+
+### WebSocket orderbook smoke test (DB-driven)
+
+Use saved pair outcome links from `data/pair_manager.db` and stream orderbooks via PMXT:
+
+```bash
+.venv/bin/python scripts/ws_orderbook_smoke.py --max-streams 10 --updates-per-stream 1
+```
+
+Notes:
+- Uses `active_only=true`, `include_expired=false` by default.
+- Add `--include-inactive` and/or `--include-expired` to widen selection.
+- Kalshi streaming requires auth; this repo supports `KALSHI_API_KEY` plus `KALSHI_PRIVATE_KEY=./key.pem`.
 
 ## API reference
 
