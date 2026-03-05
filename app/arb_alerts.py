@@ -346,10 +346,38 @@ def outcome_stream_keys(mapping: SemanticMapping) -> set[tuple[str, str]]:
     }
 
 
-def mapping_stream_keys(mappings: list[SemanticMapping]) -> set[tuple[str, str]]:
+def _normalize_kalshi_outcome_id(outcome_id: str) -> str:
+    if outcome_id.endswith("-NO"):
+        return outcome_id[: -len("-NO")]
+    return outcome_id
+
+
+def _canonical_stream_key(
+    exchange: str,
+    outcome_id: str,
+    *,
+    canonicalize_kalshi: bool,
+) -> tuple[str, str]:
+    if canonicalize_kalshi and exchange == "kalshi":
+        return exchange, _normalize_kalshi_outcome_id(outcome_id)
+    return exchange, outcome_id
+
+
+def mapping_stream_keys(
+    mappings: list[SemanticMapping],
+    *,
+    canonicalize_kalshi: bool = False,
+) -> set[tuple[str, str]]:
     keys: set[tuple[str, str]] = set()
     for mapping in mappings:
-        keys.update(outcome_stream_keys(mapping))
+        for exchange, outcome_id in outcome_stream_keys(mapping):
+            keys.add(
+                _canonical_stream_key(
+                    exchange,
+                    outcome_id,
+                    canonicalize_kalshi=canonicalize_kalshi,
+                )
+            )
     return keys
 
 
@@ -372,11 +400,60 @@ def _quote_ask(
     now: float,
     stale_after_seconds: float,
 ) -> float | None:
-    quote = quotes_by_stream.get((exchange, outcome_id))
-    if not _quote_is_fresh(quote, now=now, stale_after_seconds=stale_after_seconds):
-        return None
-    return quote.best_ask
+    raw_key = (exchange, outcome_id)
+    quote = quotes_by_stream.get(raw_key)
+    if _quote_is_fresh(quote, now=now, stale_after_seconds=stale_after_seconds):
+        return quote.best_ask
 
+    if exchange != "kalshi":
+        return None
+
+    # For Kalshi we canonicalize to one stream per market ticker (YES side),
+    # then derive NO ask as complement of YES bid.
+    requested_is_no = outcome_id.endswith("-NO")
+    canonical_key = ("kalshi", _normalize_kalshi_outcome_id(outcome_id))
+    canonical_quote = quotes_by_stream.get(canonical_key)
+    if _quote_is_fresh(canonical_quote, now=now, stale_after_seconds=stale_after_seconds):
+        if requested_is_no:
+            if canonical_quote.best_bid is None:
+                return None
+            derived = 1.0 - canonical_quote.best_bid
+            if derived < 0.0:
+                return 0.0
+            if derived > 1.0:
+                return 1.0
+            return derived
+        return canonical_quote.best_ask
+
+    # If canonical quote is absent but opposite-side raw quote exists,
+    # derive requested ask from opposite bid.
+    opposite_outcome_id = (
+        outcome_id[: -len("-NO")] if requested_is_no else f"{outcome_id}-NO"
+    )
+    opposite_raw_key = (exchange, opposite_outcome_id)
+    opposite_quote = quotes_by_stream.get(opposite_raw_key)
+    if not _quote_is_fresh(opposite_quote, now=now, stale_after_seconds=stale_after_seconds):
+        opposite_quote = None
+
+    if opposite_quote is None:
+        opposite_key = _canonical_stream_key(
+            exchange,
+            opposite_outcome_id,
+            canonicalize_kalshi=True,
+        )
+        opposite_quote = quotes_by_stream.get(opposite_key)
+
+    if not _quote_is_fresh(opposite_quote, now=now, stale_after_seconds=stale_after_seconds):
+        return None
+    if opposite_quote.best_bid is None:
+        return None
+
+    derived_ask = 1.0 - opposite_quote.best_bid
+    if derived_ask < 0.0:
+        return 0.0
+    if derived_ask > 1.0:
+        return 1.0
+    return derived_ask
 
 def evaluate_mapping(
     mapping: SemanticMapping,

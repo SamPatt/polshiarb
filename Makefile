@@ -2,6 +2,7 @@ VENV_DIR ?= .venv
 PYTHON ?= $(VENV_DIR)/bin/python
 HOST ?= 127.0.0.1
 PORT ?= 8011
+ARB_ALERTS_ARGS ?=
 
 .PHONY: setup init-db run-web run-arb-alerts test check-pmxt
 
@@ -17,7 +18,7 @@ run-web:
 	$(PYTHON) -m uvicorn app.main:app --host $(HOST) --port $(PORT) --reload
 
 run-arb-alerts:
-	$(PYTHON) scripts/ws_arb_alerts.py
+	$(PYTHON) scripts/ws_arb_alerts.py $(ARB_ALERTS_ARGS)
 
 test:
 	$(PYTHON) -m pytest -q

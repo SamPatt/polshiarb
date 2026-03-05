@@ -6,6 +6,7 @@ from app.arb_alerts import (
     QuoteSnapshot,
     build_semantic_mappings,
     evaluate_all_mappings,
+    mapping_stream_keys,
     normalize_monitoring_rows,
     passes_cooldown,
 )
@@ -340,3 +341,101 @@ def test_missing_asks_skip_evaluation() -> None:
         stale_after_seconds=15.0,
     )
     assert events == []
+
+
+def test_kalshi_stream_key_canonicalization_dedupes_no_suffix() -> None:
+    monitoring_payload = {
+        "ok": True,
+        "pairs": [
+            {
+                "pair_id": 1,
+                "mappings": [
+                    {
+                        "relation_type": "same_direction",
+                        "legs": [
+                            {"exchange": "kalshi", "market_id": "KX-1", "outcome_id": "KX-YES"},
+                            {"exchange": "polymarket", "market_id": "PM-1", "outcome_id": "PM-YES"},
+                        ],
+                    },
+                    {
+                        "relation_type": "same_direction",
+                        "legs": [
+                            {"exchange": "kalshi", "market_id": "KX-1", "outcome_id": "KX-YES-NO"},
+                            {"exchange": "polymarket", "market_id": "PM-1", "outcome_id": "PM-NO"},
+                        ],
+                    },
+                ],
+            }
+        ],
+    }
+    pair_payload = _pair_details_payload()
+    pair_payload["pair"]["markets"]["kalshi"][0]["raw_snapshot"]["yes"]["outcome_id"] = "KX-YES"
+    pair_payload["pair"]["markets"]["kalshi"][0]["raw_snapshot"]["no"]["outcome_id"] = "KX-YES-NO"
+    rows = normalize_monitoring_rows(monitoring_payload)
+    mappings, _ = build_semantic_mappings(rows, {1: pair_payload})
+
+    stream_keys = mapping_stream_keys(mappings, canonicalize_kalshi=True)
+    assert ("kalshi", "KX-YES") in stream_keys
+    assert ("kalshi", "KX-YES-NO") not in stream_keys
+    assert ("polymarket", "PM-YES") in stream_keys
+    assert ("polymarket", "PM-NO") in stream_keys
+
+
+def test_kalshi_no_ask_is_derived_from_yes_bid_when_no_stream_absent() -> None:
+    now = time.time()
+    monitoring_payload = {
+        "ok": True,
+        "pairs": [
+            {
+                "pair_id": 1,
+                "mappings": [
+                    {
+                        "relation_type": "same_direction",
+                        "legs": [
+                            {"exchange": "kalshi", "market_id": "KX-1", "outcome_id": "KX-YES"},
+                            {"exchange": "polymarket", "market_id": "PM-1", "outcome_id": "PM-YES"},
+                        ],
+                    },
+                    {
+                        "relation_type": "same_direction",
+                        "legs": [
+                            {"exchange": "kalshi", "market_id": "KX-1", "outcome_id": "KX-YES-NO"},
+                            {"exchange": "polymarket", "market_id": "PM-1", "outcome_id": "PM-NO"},
+                        ],
+                    },
+                ],
+            }
+        ],
+    }
+    pair_payload = _pair_details_payload()
+    pair_payload["pair"]["markets"]["kalshi"][0]["raw_snapshot"]["yes"]["outcome_id"] = "KX-YES"
+    pair_payload["pair"]["markets"]["kalshi"][0]["raw_snapshot"]["no"]["outcome_id"] = "KX-YES-NO"
+    rows = normalize_monitoring_rows(monitoring_payload)
+    mappings, _ = build_semantic_mappings(rows, {1: pair_payload})
+
+    quotes = {
+        # Only canonical Kalshi stream key is present.
+        ("kalshi", "KX-YES"): QuoteSnapshot(
+            exchange="kalshi",
+            outcome_id="KX-YES",
+            best_bid=0.60,
+            best_ask=0.61,
+            book_timestamp_ms=None,
+            updated_at=now,
+        ),
+        ("polymarket", "PM-YES"): _quote("polymarket", "PM-YES", 0.55, now),
+        ("polymarket", "PM-NO"): _quote("polymarket", "PM-NO", 0.38, now),
+    }
+    events = evaluate_all_mappings(
+        mappings,
+        quotes_by_stream=quotes,
+        now=now,
+        arb_threshold=0.02,
+        deviation_threshold=0.03,
+        stale_after_seconds=15.0,
+    )
+    metric_values = {event.metric_name: event.metric_value for event in events}
+    # Derived NO ask = 1 - YES bid = 0.40 -> within_kalshi edge = 1 - (0.61 + 0.40) = -0.01
+    # cross_market_set_2 edge = 1 - (0.55 + 0.40) = 0.05
+    assert "cross_market_set_2" in metric_values
+    assert abs(metric_values["cross_market_set_2"] - 0.05) < 1e-9

@@ -100,7 +100,11 @@ def test_script_emits_cross_within_and_deviation_alert_tags(monkeypatch) -> None
             return None
 
     monkeypatch.setattr(module, "_http_get_json", fake_http_get_json)
-    monkeypatch.setattr(module, "_build_exchange", lambda exchange: FakeExchange())
+    monkeypatch.setattr(
+        module,
+        "_build_exchange",
+        lambda exchange, **kwargs: FakeExchange(),
+    )
 
     args = argparse.Namespace(
         api_base_url="http://127.0.0.1:8011",
