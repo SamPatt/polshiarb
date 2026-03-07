@@ -30,6 +30,12 @@ class SemanticMapping:
     kalshi_not_p: str
     polymarket_p: str
     polymarket_not_p: str
+    kalshi_market_title: str | None = None
+    polymarket_market_title: str | None = None
+    kalshi_p_label: str | None = None
+    kalshi_not_p_label: str | None = None
+    polymarket_p_label: str | None = None
+    polymarket_not_p_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +60,12 @@ class AlertEvent:
     metric_value: float
     threshold: float
     details: dict[str, str]
+    kalshi_market_title: str | None = None
+    polymarket_market_title: str | None = None
+    kalshi_p_label: str | None = None
+    kalshi_not_p_label: str | None = None
+    polymarket_p_label: str | None = None
+    polymarket_not_p_label: str | None = None
 
 
 def level_price(level: Any) -> float | None:
@@ -227,6 +239,76 @@ def _market_side_lookup(
     return side_map
 
 
+def _market_metadata_lookup(
+    pair_details_payload: dict[str, Any],
+) -> tuple[
+    dict[tuple[str, str], str],
+    dict[tuple[str, str, str], str],
+]:
+    pair_obj = pair_details_payload.get("pair")
+    if not isinstance(pair_obj, dict):
+        return {}, {}
+
+    markets = pair_obj.get("markets")
+    if not isinstance(markets, dict):
+        return {}, {}
+
+    title_map: dict[tuple[str, str], str] = {}
+    outcome_label_map: dict[tuple[str, str, str], str] = {}
+
+    for exchange in ("kalshi", "polymarket"):
+        exchange_markets = markets.get(exchange)
+        if not isinstance(exchange_markets, list):
+            continue
+
+        for market in exchange_markets:
+            if not isinstance(market, dict):
+                continue
+
+            market_id = market.get("market_id")
+            raw_snapshot = market.get("raw_snapshot")
+            source = raw_snapshot if isinstance(raw_snapshot, dict) else market
+            if not isinstance(market_id, str) or not market_id:
+                continue
+
+            title = market.get("title")
+            if not isinstance(title, str) or not title:
+                title = source.get("title")
+            if isinstance(title, str) and title:
+                title_map[(exchange, market_id)] = title
+
+            outcomes = source.get("outcomes")
+            if isinstance(outcomes, list):
+                for outcome in outcomes:
+                    if not isinstance(outcome, dict):
+                        continue
+                    outcome_id = outcome.get("outcome_id")
+                    label = outcome.get("label")
+                    if (
+                        isinstance(outcome_id, str)
+                        and outcome_id
+                        and isinstance(label, str)
+                        and label
+                    ):
+                        outcome_label_map[(exchange, market_id, outcome_id)] = label
+
+            for side in ("yes", "no"):
+                outcome_obj = source.get(side)
+                if not isinstance(outcome_obj, dict):
+                    continue
+                outcome_id = outcome_obj.get("outcome_id")
+                label = outcome_obj.get("label")
+                if (
+                    isinstance(outcome_id, str)
+                    and outcome_id
+                    and isinstance(label, str)
+                    and label
+                ):
+                    outcome_label_map[(exchange, market_id, outcome_id)] = label
+
+    return title_map, outcome_label_map
+
+
 def build_semantic_mappings(
     monitoring_rows: list[MappingRow],
     pair_details_by_id: dict[int, dict[str, Any]],
@@ -235,8 +317,13 @@ def build_semantic_mappings(
     grouped: dict[tuple[int, str, str], dict[str, Any]] = {}
 
     side_lookup_by_pair: dict[int, dict[tuple[str, str, str], str]] = {}
+    title_lookup_by_pair: dict[int, dict[tuple[str, str], str]] = {}
+    outcome_label_lookup_by_pair: dict[int, dict[tuple[str, str, str], str]] = {}
     for pair_id, payload in pair_details_by_id.items():
         side_lookup_by_pair[pair_id] = _market_side_lookup(payload)
+        title_map, outcome_label_map = _market_metadata_lookup(payload)
+        title_lookup_by_pair[pair_id] = title_map
+        outcome_label_lookup_by_pair[pair_id] = outcome_label_map
 
     for row in monitoring_rows:
         side_lookup = side_lookup_by_pair.get(row.pair_id, {})
@@ -275,6 +362,12 @@ def build_semantic_mappings(
                 "relation_type": row.relation_type,
                 "kalshi_market_id": row.kalshi.market_id,
                 "polymarket_market_id": row.polymarket.market_id,
+                "kalshi_market_title": title_lookup_by_pair.get(row.pair_id, {}).get(
+                    ("kalshi", row.kalshi.market_id)
+                ),
+                "polymarket_market_title": title_lookup_by_pair.get(row.pair_id, {}).get(
+                    ("polymarket", row.polymarket.market_id)
+                ),
                 "kalshi_p": None,
                 "kalshi_not_p": None,
                 "polymarket_p": None,
@@ -324,6 +417,20 @@ def build_semantic_mappings(
                 kalshi_not_p=group["kalshi_not_p"],
                 polymarket_p=group["polymarket_p"],
                 polymarket_not_p=group["polymarket_not_p"],
+                kalshi_market_title=group["kalshi_market_title"],
+                polymarket_market_title=group["polymarket_market_title"],
+                kalshi_p_label=outcome_label_lookup_by_pair.get(group["pair_id"], {}).get(
+                    ("kalshi", group["kalshi_market_id"], group["kalshi_p"])
+                ),
+                kalshi_not_p_label=outcome_label_lookup_by_pair.get(group["pair_id"], {}).get(
+                    ("kalshi", group["kalshi_market_id"], group["kalshi_not_p"])
+                ),
+                polymarket_p_label=outcome_label_lookup_by_pair.get(group["pair_id"], {}).get(
+                    ("polymarket", group["polymarket_market_id"], group["polymarket_p"])
+                ),
+                polymarket_not_p_label=outcome_label_lookup_by_pair.get(group["pair_id"], {}).get(
+                    ("polymarket", group["polymarket_market_id"], group["polymarket_not_p"])
+                ),
             )
         )
 
@@ -494,6 +601,18 @@ def evaluate_mapping(
     )
 
     events: list[AlertEvent] = []
+    base_event_fields: dict[str, Any] = {
+        "pair_id": mapping.pair_id,
+        "kalshi_market_id": mapping.kalshi_market_id,
+        "polymarket_market_id": mapping.polymarket_market_id,
+        "relation_type": mapping.relation_type,
+        "kalshi_market_title": mapping.kalshi_market_title,
+        "polymarket_market_title": mapping.polymarket_market_title,
+        "kalshi_p_label": mapping.kalshi_p_label,
+        "kalshi_not_p_label": mapping.kalshi_not_p_label,
+        "polymarket_p_label": mapping.polymarket_p_label,
+        "polymarket_not_p_label": mapping.polymarket_not_p_label,
+    }
 
     if k_p is not None and pm_not_p is not None:
         edge = 1.0 - (k_p + pm_not_p)
@@ -507,10 +626,7 @@ def evaluate_mapping(
                         f"|pm={mapping.polymarket_market_id}"
                     ),
                     tag="ALERT_ARB_CROSS",
-                    pair_id=mapping.pair_id,
-                    kalshi_market_id=mapping.kalshi_market_id,
-                    polymarket_market_id=mapping.polymarket_market_id,
-                    relation_type=mapping.relation_type,
+                    **base_event_fields,
                     metric_name="cross_market_set_1",
                     metric_value=edge,
                     threshold=arb_threshold,
@@ -533,10 +649,7 @@ def evaluate_mapping(
                         f"|pm={mapping.polymarket_market_id}"
                     ),
                     tag="ALERT_ARB_CROSS",
-                    pair_id=mapping.pair_id,
-                    kalshi_market_id=mapping.kalshi_market_id,
-                    polymarket_market_id=mapping.polymarket_market_id,
-                    relation_type=mapping.relation_type,
+                    **base_event_fields,
                     metric_name="cross_market_set_2",
                     metric_value=edge,
                     threshold=arb_threshold,
@@ -559,10 +672,7 @@ def evaluate_mapping(
                         f"|pm={mapping.polymarket_market_id}"
                     ),
                     tag="ALERT_ARB_WITHIN",
-                    pair_id=mapping.pair_id,
-                    kalshi_market_id=mapping.kalshi_market_id,
-                    polymarket_market_id=mapping.polymarket_market_id,
-                    relation_type=mapping.relation_type,
+                    **base_event_fields,
                     metric_name="within_kalshi",
                     metric_value=edge,
                     threshold=arb_threshold,
@@ -585,10 +695,7 @@ def evaluate_mapping(
                         f"|pm={mapping.polymarket_market_id}"
                     ),
                     tag="ALERT_ARB_WITHIN",
-                    pair_id=mapping.pair_id,
-                    kalshi_market_id=mapping.kalshi_market_id,
-                    polymarket_market_id=mapping.polymarket_market_id,
-                    relation_type=mapping.relation_type,
+                    **base_event_fields,
                     metric_name="within_polymarket",
                     metric_value=edge,
                     threshold=arb_threshold,
@@ -611,10 +718,7 @@ def evaluate_mapping(
                         f"|pm={mapping.polymarket_market_id}"
                     ),
                     tag="ALERT_DEVIATION",
-                    pair_id=mapping.pair_id,
-                    kalshi_market_id=mapping.kalshi_market_id,
-                    polymarket_market_id=mapping.polymarket_market_id,
-                    relation_type=mapping.relation_type,
+                    **base_event_fields,
                     metric_name="same_token_gap_p",
                     metric_value=gap,
                     threshold=deviation_threshold,
@@ -637,10 +741,7 @@ def evaluate_mapping(
                         f"|pm={mapping.polymarket_market_id}"
                     ),
                     tag="ALERT_DEVIATION",
-                    pair_id=mapping.pair_id,
-                    kalshi_market_id=mapping.kalshi_market_id,
-                    polymarket_market_id=mapping.polymarket_market_id,
-                    relation_type=mapping.relation_type,
+                    **base_event_fields,
                     metric_name="same_token_gap_not_p",
                     metric_value=gap,
                     threshold=deviation_threshold,
