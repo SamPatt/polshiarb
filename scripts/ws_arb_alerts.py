@@ -118,6 +118,51 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--multiplex-kalshi-worker-count",
+        type=int,
+        default=2,
+        help=(
+            "Number of bounded producer workers to run for Kalshi multiplex ingestion "
+            "(default: 2)."
+        ),
+    )
+    parser.add_argument(
+        "--multiplex-polymarket-worker-count",
+        type=int,
+        default=1,
+        help=(
+            "Number of bounded producer workers to run for Polymarket multiplex ingestion "
+            "(default: 1; ignored when direct Polymarket websocket mode is enabled)."
+        ),
+    )
+    parser.add_argument(
+        "--multiplex-polymarket-source-mode",
+        choices=("direct", "poll"),
+        default="direct",
+        help=(
+            "Primary Polymarket multiplex source mode. 'direct' uses the exchange market "
+            "websocket with shared multi-asset subscriptions; 'poll' keeps the legacy "
+            "PMXT fetch loop as a fallback path."
+        ),
+    )
+    parser.add_argument(
+        "--multiplex-polymarket-market-ws-url",
+        default="wss://ws-subscriptions-clob.polymarket.com/ws/market",
+        help="Polymarket market websocket URL for direct multiplex mode.",
+    )
+    parser.add_argument(
+        "--multiplex-polymarket-ping-interval-seconds",
+        type=float,
+        default=5.0,
+        help="Application ping interval for direct Polymarket websocket mode.",
+    )
+    parser.add_argument(
+        "--multiplex-polymarket-receive-timeout-seconds",
+        type=float,
+        default=1.0,
+        help="Receive timeout for direct Polymarket websocket mode.",
+    )
+    parser.add_argument(
         "--depth",
         type=int,
         default=None,
@@ -161,7 +206,7 @@ def _parse_args() -> argparse.Namespace:
         default="legacy",
         help=(
             "Streaming engine to run. 'legacy' keeps one worker per stream; "
-            "'multiplex' is reserved for the new exchange-level ingestion path."
+            "'multiplex' uses exchange-level ingestion with direct Polymarket websocket support."
         ),
     )
     parser.add_argument(

@@ -46,6 +46,8 @@ class QuoteSnapshot:
     best_ask: float | None
     book_timestamp_ms: int | None
     updated_at: float
+    quote_seen_at: float | None = None
+    source_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -459,7 +461,7 @@ def _normalize_kalshi_outcome_id(outcome_id: str) -> str:
     return outcome_id
 
 
-def _canonical_stream_key(
+def canonical_stream_key(
     exchange: str,
     outcome_id: str,
     *,
@@ -479,7 +481,7 @@ def mapping_stream_keys(
     for mapping in mappings:
         for exchange, outcome_id in outcome_stream_keys(mapping):
             keys.add(
-                _canonical_stream_key(
+                canonical_stream_key(
                     exchange,
                     outcome_id,
                     canonicalize_kalshi=canonicalize_kalshi,
@@ -543,7 +545,7 @@ def _quote_ask(
         opposite_quote = None
 
     if opposite_quote is None:
-        opposite_key = _canonical_stream_key(
+        opposite_key = canonical_stream_key(
             exchange,
             opposite_outcome_id,
             canonicalize_kalshi=True,
@@ -797,9 +799,19 @@ def passes_cooldown(
     return False
 
 
-def format_alert_line(event: AlertEvent, *, emitted_at: datetime | None = None) -> str:
+def format_alert_line(
+    event: AlertEvent,
+    *,
+    emitted_at: datetime | None = None,
+    extra_fields: dict[str, str] | None = None,
+) -> str:
     ts = emitted_at or datetime.now(timezone.utc)
     detail_blob = " ".join(f"{key}={value}" for key, value in sorted(event.details.items()))
+    extra_blob = ""
+    if extra_fields:
+        extra_blob = " " + " ".join(
+            f"{key}={value}" for key, value in sorted(extra_fields.items())
+        )
     return (
         f"[{event.tag}] "
         f"ts={ts.isoformat()} "
@@ -810,5 +822,5 @@ def format_alert_line(event: AlertEvent, *, emitted_at: datetime | None = None) 
         f"metric={event.metric_name} "
         f"value={event.metric_value:.4f} "
         f"threshold={event.threshold:.4f} "
-        f"{detail_blob}"
+        f"{detail_blob}{extra_blob}"
     )

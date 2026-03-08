@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 from pathlib import Path
 import threading
 import time
@@ -15,6 +16,7 @@ from app.streaming.manager import (
     MultiplexSubscriptionManager,
     QueuedQuoteUpdate,
 )
+from app.streaming.polymarket_ws import parse_polymarket_ws_quote_updates
 from app.streaming.store import QuoteStore
 
 
@@ -616,6 +618,268 @@ def test_multiplex_mapping_refresh_debounce_coalesces_periodic_updates(monkeypat
         manager.stop(reason="test", timeout_seconds=1.0)
 
 
+def test_parse_polymarket_ws_quote_updates_prefers_best_bid_ask_and_book() -> None:
+    updates = parse_polymarket_ws_quote_updates(
+        json.dumps(
+            [
+                {
+                    "event_type": "best_bid_ask",
+                    "asset_id": "PM-YES",
+                    "best_bid": "0.41",
+                    "best_ask": "0.43",
+                    "timestamp": "1736200000123",
+                },
+                {
+                    "event_type": "book",
+                    "asset_id": "PM-NO",
+                    "bids": [{"price": "0.57"}, {"price": "0.56"}],
+                    "asks": [{"price": "0.60"}, {"price": "0.61"}],
+                    "timestamp": "1736200000456",
+                },
+            ]
+        )
+    )
+
+    assert [update.outcome_id for update in updates] == ["PM-YES", "PM-NO"]
+    assert updates[0].best_bid == 0.41
+    assert updates[0].best_ask == 0.43
+    assert updates[0].book_timestamp_ms == 1736200000123
+    assert updates[0].source_label == "direct_ws_best_bid_ask"
+    assert updates[1].best_bid == 0.57
+    assert updates[1].best_ask == 0.6
+    assert updates[1].book_timestamp_ms == 1736200000456
+    assert updates[1].source_label == "direct_ws_book"
+
+
+def test_parse_polymarket_ws_quote_updates_labels_price_changes() -> None:
+    updates = parse_polymarket_ws_quote_updates(
+        json.dumps(
+            {
+                "event_type": "price_change",
+                "timestamp": "1736200000789",
+                "price_changes": [
+                    {
+                        "asset_id": "PM-YES",
+                        "best_bid": "0.51",
+                        "best_ask": "0.53",
+                    }
+                ],
+            }
+        )
+    )
+
+    assert len(updates) == 1
+    assert updates[0].outcome_id == "PM-YES"
+    assert updates[0].best_bid == 0.51
+    assert updates[0].best_ask == 0.53
+    assert updates[0].book_timestamp_ms == 1736200000789
+    assert updates[0].source_label == "direct_ws_price_change"
+
+
+def test_multiplex_polymarket_direct_ws_ingests_shared_socket_updates(monkeypatch) -> None:
+    import app.streaming.polymarket_ws as polymarket_ws_module
+
+    sent_messages: list[str] = []
+    recv_payloads = [
+        json.dumps(
+            [
+                {
+                    "event_type": "best_bid_ask",
+                    "asset_id": "PM-YES",
+                    "best_bid": "0.44",
+                    "best_ask": "0.46",
+                    "timestamp": str(int(time.time() * 1000)),
+                }
+            ]
+        )
+    ]
+
+    class FakeConnection:
+        def send(self, payload):  # noqa: ANN001
+            sent_messages.append(payload)
+
+        def recv(self, timeout=None, decode=None):  # noqa: ANN001
+            if recv_payloads:
+                return recv_payloads.pop(0)
+            raise TimeoutError()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(polymarket_ws_module, "connect", lambda *args, **kwargs: FakeConnection())
+
+    lines: list[str] = []
+    seen_stream_keys: list[tuple[str, str]] = []
+    stop_event = threading.Event()
+    manager = MultiplexSubscriptionManager(
+        args=argparse.Namespace(
+            api_base_url="http://127.0.0.1:8011",
+            arb_threshold=0.02,
+            deviation_threshold=0.03,
+            cooldown_seconds=60.0,
+            mapping_refresh_seconds=3600.0,
+            book_stale_seconds=15.0,
+            depth=None,
+            include_expired=False,
+            include_inactive=False,
+            engine="multiplex",
+            debug=True,
+            multiplex_polymarket_source_mode="direct",
+            multiplex_polymarket_ping_interval_seconds=30.0,
+            multiplex_polymarket_receive_timeout_seconds=0.01,
+        ),
+        quote_store=QuoteStore(),
+        stop_event=stop_event,
+        print_line=lambda line: lines.append(line),
+        debug=lambda line: lines.append(f"[debug] {line}"),
+        exchange_builder=lambda exchange, **kwargs: object(),
+        on_quote_update=lambda stream_key: seen_stream_keys.append(stream_key),
+    )
+    ingestor = MultiplexExchangeIngestor(manager=manager, exchange="polymarket")
+    ingestor.replace_subscriptions({"PM-YES"})
+    manager._exchange_ingestors["polymarket"] = ingestor  # type: ignore[attr-defined]
+
+    worker_thread = threading.Thread(target=manager.worker_loop, args=(ingestor,), daemon=True)
+    dispatch_thread = threading.Thread(target=manager.dispatch_loop, args=(ingestor,), daemon=True)
+    worker_thread.start()
+    dispatch_thread.start()
+
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        if seen_stream_keys:
+            break
+        time.sleep(0.01)
+
+    stop_event.set()
+    ingestor.stop()
+    worker_thread.join(timeout=1.0)
+    dispatch_thread.join(timeout=1.0)
+
+    snapshot = manager._quote_store.snapshot()  # type: ignore[attr-defined]
+    assert snapshot["quotes"][("polymarket", "PM-YES")].best_bid == 0.44
+    assert snapshot["quotes"][("polymarket", "PM-YES")].best_ask == 0.46
+    assert snapshot["quotes"][("polymarket", "PM-YES")].source_label == "direct_ws_best_bid_ask"
+    assert seen_stream_keys == [("polymarket", "PM-YES")]
+    assert any('"assets_ids": ["PM-YES"]' in payload for payload in sent_messages)
+    assert any("multiplex direct ws loop entering exchange=polymarket" in line for line in lines)
+
+
+def test_multiplex_polymarket_direct_ws_runs_quiet_refresh_only_on_idle(monkeypatch) -> None:
+    lines: list[str] = []
+    stop_event = threading.Event()
+    refresh_calls: list[float] = []
+
+    class FakeWsClient:
+        def sync_subscriptions(self, outcome_ids):  # noqa: ANN001
+            assert outcome_ids == {"PM-YES"}
+            return set(), set()
+
+        def recv_quote_updates(self):  # noqa: ANN001
+            stop_event.set()
+            raise TimeoutError()
+
+    manager = MultiplexSubscriptionManager(
+        args=argparse.Namespace(
+            api_base_url="http://127.0.0.1:8011",
+            arb_threshold=0.02,
+            deviation_threshold=0.03,
+            cooldown_seconds=60.0,
+            mapping_refresh_seconds=3600.0,
+            book_stale_seconds=15.0,
+            depth=None,
+            include_expired=False,
+            include_inactive=False,
+            engine="multiplex",
+            debug=True,
+            multiplex_polymarket_source_mode="direct",
+        ),
+        quote_store=QuoteStore(),
+        stop_event=stop_event,
+        print_line=lambda line: lines.append(line),
+        debug=lambda line: lines.append(f"[debug] {line}"),
+        exchange_builder=lambda exchange, **kwargs: object(),
+        on_quote_update=lambda _stream_key: None,
+    )
+    ingestor = MultiplexExchangeIngestor(manager=manager, exchange="polymarket")
+    ingestor.replace_subscriptions({"PM-YES"})
+    manager._exchange_ingestors["polymarket"] = ingestor  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(manager, "_get_polymarket_ws_client", lambda: FakeWsClient())
+    monkeypatch.setattr(manager, "_close_exchange_client", lambda exchange: None)
+    monkeypatch.setattr(
+        manager,
+        "_refresh_polymarket_direct_quiet_books",
+        lambda *, ingestor, now: refresh_calls.append(now),
+    )
+
+    manager._run_polymarket_direct_loop(ingestor)
+
+    assert len(refresh_calls) == 1
+    assert any("multiplex direct ws loop exiting exchange=polymarket" in line for line in lines)
+
+
+def test_multiplex_polymarket_direct_quiet_refresh_fetches_stale_books() -> None:
+    lines: list[str] = []
+
+    class FakeExchange:
+        def fetch_order_book(self, outcome_id):  # noqa: ANN001
+            assert outcome_id == "PM-STALE"
+            return {
+                "timestamp": int(time.time() * 1000),
+                "bids": [{"price": 0.42, "size": 10.0}],
+                "asks": [{"price": 0.47, "size": 10.0}],
+            }
+
+        def close(self) -> None:
+            return None
+
+    manager = MultiplexSubscriptionManager(
+        args=argparse.Namespace(
+            api_base_url="http://127.0.0.1:8011",
+            arb_threshold=0.02,
+            deviation_threshold=0.03,
+            cooldown_seconds=60.0,
+            mapping_refresh_seconds=3600.0,
+            book_stale_seconds=15.0,
+            depth=None,
+            include_expired=False,
+            include_inactive=False,
+            engine="multiplex",
+            debug=True,
+            multiplex_polymarket_source_mode="direct",
+            multiplex_polymarket_direct_quiet_refresh_seconds=1.0,
+            multiplex_polymarket_direct_quiet_refresh_batch_size=2,
+        ),
+        quote_store=QuoteStore(),
+        stop_event=threading.Event(),
+        print_line=lambda line: lines.append(line),
+        debug=lambda line: lines.append(f"[debug] {line}"),
+        exchange_builder=lambda exchange, **kwargs: FakeExchange(),
+        on_quote_update=lambda _stream_key: None,
+    )
+    ingestor = MultiplexExchangeIngestor(manager=manager, exchange="polymarket")
+    ingestor.replace_subscriptions({"PM-STALE"})
+    manager._exchange_ingestors["polymarket"] = ingestor  # type: ignore[attr-defined]
+
+    now = time.time()
+    with manager._state_lock:
+        manager._stream_last_watch_ok_at[("polymarket", "PM-STALE")] = now - 5.0
+
+    manager._refresh_polymarket_direct_quiet_books(ingestor=ingestor, now=now)
+    quote_update = ingestor.next_quote_update()
+
+    assert quote_update is not None
+    assert quote_update.quote.outcome_id == "PM-STALE"
+    assert quote_update.quote.best_bid == 0.42
+    assert quote_update.quote.best_ask == 0.47
+    assert quote_update.quote.source_label == "quiet_refresh"
+    assert any(
+        "multiplex direct quiet refresh exchange=polymarket outcomes=PM-STALE count=1"
+        in line
+        for line in lines
+    )
+
+
 def test_multiplex_kalshi_warmup_releases_in_batches(monkeypatch) -> None:
     module = _load_script_module()
 
@@ -716,7 +980,7 @@ def test_multiplex_stale_recovery_prioritizes_only_stale_outcome() -> None:
         print_line=lambda line: lines.append(line),
         debug=lambda line: lines.append(f"[debug] {line}"),
         exchange_builder=lambda exchange, **kwargs: object(),
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
     ingestor = MultiplexExchangeIngestor(manager=manager, exchange="polymarket")
     ingestor.replace_subscriptions({"PM-1", "PM-2", "PM-3"})
@@ -772,7 +1036,7 @@ def test_multiplex_aging_refresh_prioritizes_pre_stale_outcomes() -> None:
         print_line=lambda line: lines.append(line),
         debug=lambda line: lines.append(f"[debug] {line}"),
         exchange_builder=lambda exchange, **kwargs: object(),
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
     ingestor = MultiplexExchangeIngestor(manager=manager, exchange="polymarket")
     ingestor.replace_subscriptions({"PM-1", "PM-2", "PM-3", "PM-4"})
@@ -825,7 +1089,7 @@ def test_multiplex_aging_refresh_respects_existing_priority_budget() -> None:
         print_line=lambda line: None,
         debug=lambda line: None,
         exchange_builder=lambda exchange, **kwargs: object(),
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
     ingestor = MultiplexExchangeIngestor(manager=manager, exchange="polymarket")
     ingestor.replace_subscriptions({"PM-1", "PM-2", "PM-3", "PM-4"})
@@ -872,7 +1136,7 @@ def test_multiplex_stale_recovery_limits_priority_batch_to_oldest_stale_outcomes
         print_line=lambda line: lines.append(line),
         debug=lambda line: lines.append(f"[debug] {line}"),
         exchange_builder=lambda exchange, **kwargs: object(),
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
     ingestor = MultiplexExchangeIngestor(manager=manager, exchange="polymarket")
     ingestor.replace_subscriptions({"PM-1", "PM-2", "PM-3", "PM-4"})
@@ -924,7 +1188,7 @@ def test_multiplex_stale_recovery_respects_existing_priority_backlog_budget() ->
         print_line=lambda line: None,
         debug=lambda line: None,
         exchange_builder=lambda exchange, **kwargs: object(),
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
     ingestor = MultiplexExchangeIngestor(manager=manager, exchange="polymarket")
     ingestor.replace_subscriptions({"PM-1", "PM-2", "PM-3", "PM-4"})
@@ -967,7 +1231,7 @@ def test_multiplex_scheduler_prioritizes_active_outcomes_without_success() -> No
         print_line=lambda line: None,
         debug=lambda line: None,
         exchange_builder=lambda exchange, **kwargs: object(),
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
     ingestor = MultiplexExchangeIngestor(manager=manager, exchange="polymarket")
     ingestor.replace_subscriptions({"PM-1", "PM-2", "PM-3"})
@@ -1004,7 +1268,7 @@ def test_multiplex_stale_recovery_includes_never_ok_active_outcomes() -> None:
         print_line=lambda line: lines.append(line),
         debug=lambda line: lines.append(f"[debug] {line}"),
         exchange_builder=lambda exchange, **kwargs: object(),
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
     ingestor = MultiplexExchangeIngestor(manager=manager, exchange="polymarket")
     ingestor.replace_subscriptions({"PM-1", "PM-2"})
@@ -1054,7 +1318,7 @@ def test_multiplex_kalshi_watch_stale_recovery_uses_forced_snapshot_refresh() ->
         print_line=lambda line: lines.append(line),
         debug=lambda line: lines.append(f"[debug] {line}"),
         exchange_builder=lambda exchange, **kwargs: object(),
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
     ingestor = MultiplexExchangeIngestor(manager=manager, exchange="kalshi")
     ingestor.replace_subscriptions({"KX-1", "KX-2", "KX-3"})
@@ -1142,7 +1406,7 @@ def test_multiplex_kalshi_watch_aging_refresh_uses_forced_snapshot_fetch() -> No
         print_line=lambda line: lines.append(line),
         debug=lambda line: lines.append(f"[debug] {line}"),
         exchange_builder=lambda exchange, **kwargs: object(),
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
     ingestor = MultiplexExchangeIngestor(manager=manager, exchange="kalshi")
     ingestor.replace_subscriptions({"KX-1", "KX-2", "KX-3"})
@@ -1221,7 +1485,7 @@ def test_multiplex_kalshi_forced_snapshot_refresh_fetches_while_source_mode_stay
         print_line=lambda line: None,
         debug=lambda line: None,
         exchange_builder=lambda exchange, **kwargs: client,
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
     ingestor = MultiplexExchangeIngestor(manager=manager, exchange="kalshi")
     ingestor.replace_subscriptions({"KX-1"})
@@ -1252,6 +1516,149 @@ def test_multiplex_kalshi_forced_snapshot_refresh_fetches_while_source_mode_stay
     assert ingestor.forced_fetch_outcome_ids() == {"KX-1"}
 
 
+def test_multiplex_polymarket_worker_count_is_clamped_to_one() -> None:
+    active_fetches = 0
+    active_fetches_lock = threading.Lock()
+    built_clients: list[object] = []
+    max_concurrent_fetches = 0
+
+    class FakeExchange:
+        def fetch_order_book(self, outcome_id):  # noqa: ANN001
+            nonlocal active_fetches, max_concurrent_fetches
+            with active_fetches_lock:
+                active_fetches += 1
+                max_concurrent_fetches = max(max_concurrent_fetches, active_fetches)
+            try:
+                time.sleep(0.05)
+                return {
+                    "timestamp": int(time.time() * 1000),
+                    "bids": [{"price": 0.49, "size": 10.0}],
+                    "asks": [{"price": 0.50, "size": 10.0}],
+                }
+            finally:
+                with active_fetches_lock:
+                    active_fetches -= 1
+
+        def close(self) -> None:
+            return None
+
+    manager = MultiplexSubscriptionManager(
+        args=argparse.Namespace(
+            api_base_url="http://127.0.0.1:8011",
+            arb_threshold=0.02,
+            deviation_threshold=0.03,
+            cooldown_seconds=60.0,
+            mapping_refresh_seconds=3600.0,
+            book_stale_seconds=15.0,
+            depth=None,
+            include_expired=False,
+            include_inactive=False,
+            engine="multiplex",
+            debug=True,
+            multiplex_polymarket_worker_count=4,
+        ),
+        quote_store=QuoteStore(),
+        stop_event=threading.Event(),
+        print_line=lambda line: None,
+        debug=lambda line: None,
+        exchange_builder=lambda exchange, **kwargs: built_clients.append(FakeExchange()) or built_clients[-1],
+        on_quote_update=lambda _stream_key: None,
+    )
+
+    try:
+        manager.replace_streams(
+            {
+                ("polymarket", "PM-1"),
+                ("polymarket", "PM-2"),
+                ("polymarket", "PM-3"),
+                ("polymarket", "PM-4"),
+            }
+        )
+
+        ingestor = manager._exchange_ingestors["polymarket"]
+        deadline = time.time() + 0.3
+        while time.time() < deadline and max_concurrent_fetches < 1:
+            time.sleep(0.02)
+
+        assert ingestor.producer_thread_count() == 1
+        assert max_concurrent_fetches == 1
+        assert len(built_clients) == 1
+    finally:
+        manager.stop(reason="test", timeout_seconds=1.0)
+
+
+def test_multiplex_polymarket_invalid_order_book_outcome_is_disabled() -> None:
+    lines: list[str] = []
+
+    class FakeExchange:
+        def fetch_order_book(self, outcome_id):  # noqa: ANN001
+            if outcome_id == "PM-BAD":
+                raise Exception("Failed to fetch order book: Order not found: unknown")
+            return {
+                "timestamp": int(time.time() * 1000),
+                "bids": [{"price": 0.49, "size": 10.0}],
+                "asks": [{"price": 0.50, "size": 10.0}],
+            }
+
+        def close(self) -> None:
+            return None
+
+    quote_store = QuoteStore()
+    quote_store.replace_mappings(
+        [],
+        {("polymarket", "PM-BAD"), ("polymarket", "PM-GOOD")},
+    )
+    manager = MultiplexSubscriptionManager(
+        args=argparse.Namespace(
+            api_base_url="http://127.0.0.1:8011",
+            arb_threshold=0.02,
+            deviation_threshold=0.03,
+            cooldown_seconds=60.0,
+            mapping_refresh_seconds=3600.0,
+            book_stale_seconds=15.0,
+            depth=None,
+            include_expired=False,
+            include_inactive=False,
+            engine="multiplex",
+            debug=True,
+        ),
+        quote_store=quote_store,
+        stop_event=threading.Event(),
+        print_line=lines.append,
+        debug=lambda line: lines.append(f"[debug] {line}"),
+        exchange_builder=lambda exchange, **kwargs: FakeExchange(),
+        on_quote_update=lambda _stream_key: None,
+    )
+
+    try:
+        manager.replace_streams(
+            {
+                ("polymarket", "PM-BAD"),
+                ("polymarket", "PM-GOOD"),
+            }
+        )
+
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            ingestor = manager._exchange_ingestors["polymarket"]
+            if "PM-BAD" not in ingestor.outcome_ids():
+                break
+            time.sleep(0.02)
+
+        ingestor = manager._exchange_ingestors["polymarket"]
+        assert ingestor.outcome_ids() == {"PM-GOOD"}
+        assert quote_store.snapshot()["active_streams"] == [("polymarket", "PM-GOOD")]
+        assert any(
+            line
+            == "[warn] disabled invalid order book outcome exchange=polymarket "
+            "outcome_id=PM-BAD reason=order_book_not_found"
+            for line in lines
+        )
+        assert not any("multiplex stream failure exchange=polymarket outcome_id=PM-BAD" in line for line in lines)
+    finally:
+        manager.stop(reason="test", timeout_seconds=1.0)
+
+
 def test_multiplex_exchange_mode_transitions() -> None:
     lines: list[str] = []
     args = argparse.Namespace(
@@ -1278,7 +1685,7 @@ def test_multiplex_exchange_mode_transitions() -> None:
         print_line=lambda line: lines.append(line),
         debug=lambda line: lines.append(f"[debug] {line}"),
         exchange_builder=lambda exchange, **kwargs: object(),
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
     ingestor = MultiplexExchangeIngestor(manager=manager, exchange="polymarket")
     ingestor.replace_subscriptions({"PM-1"})
@@ -1339,7 +1746,7 @@ def test_multiplex_exchange_source_mode_transitions() -> None:
         print_line=lambda line: lines.append(line),
         debug=lambda line: lines.append(f"[debug] {line}"),
         exchange_builder=lambda exchange, **kwargs: object(),
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
 
     manager.replace_streams({("polymarket", "PM-1")})
@@ -1421,7 +1828,7 @@ def test_multiplex_kalshi_watch_first_uses_watch_order_book() -> None:
         print_line=lambda line: None,
         debug=lambda line: None,
         exchange_builder=lambda exchange, **kwargs: client,
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
 
     try:
@@ -1440,6 +1847,101 @@ def test_multiplex_kalshi_watch_first_uses_watch_order_book() -> None:
         assert client.fetch_calls == 0
     finally:
         manager.stop(reason="test", timeout_seconds=1.0)
+
+
+def test_multiplex_kalshi_watch_mode_uses_worker_scoped_clients() -> None:
+    built_clients: list[object] = []
+
+    class FakeKalshiExchange:
+        def close(self) -> None:
+            return None
+
+    def build_exchange(exchange, **kwargs):  # noqa: ANN001, ANN003
+        assert exchange == "kalshi"
+        client = FakeKalshiExchange()
+        built_clients.append(client)
+        return client
+
+    manager = MultiplexSubscriptionManager(
+        args=argparse.Namespace(
+            api_base_url="http://127.0.0.1:8011",
+            arb_threshold=0.02,
+            deviation_threshold=0.03,
+            cooldown_seconds=60.0,
+            mapping_refresh_seconds=3600.0,
+            book_stale_seconds=15.0,
+            depth=None,
+            include_expired=False,
+            include_inactive=False,
+            engine="multiplex",
+            debug=True,
+            kalshi_book_mode="auto",
+            multiplex_kalshi_worker_count=2,
+        ),
+        quote_store=QuoteStore(),
+        stop_event=threading.Event(),
+        print_line=lambda line: None,
+        debug=lambda line: None,
+        exchange_builder=build_exchange,
+        on_quote_update=lambda _stream_key: None,
+    )
+
+    with manager._state_lock:  # type: ignore[attr-defined]
+        manager._exchange_source_mode["kalshi"] = "watch"  # type: ignore[attr-defined]
+        manager._exchange_source_preference["kalshi"] = "watch"  # type: ignore[attr-defined]
+
+    client0 = manager._get_client_for_worker(exchange="kalshi", worker_index=0)
+    client1 = manager._get_client_for_worker(exchange="kalshi", worker_index=1)
+    client0_again = manager._get_client_for_worker(exchange="kalshi", worker_index=0)
+
+    assert client0 is client0_again
+    assert client0 is not client1
+    assert len(built_clients) == 2
+    assert manager.health_state(now=time.time()).client_exchanges == ["kalshi"]
+
+
+def test_multiplex_kalshi_poll_mode_keeps_shared_client_across_workers() -> None:
+    built_clients: list[object] = []
+
+    class FakeKalshiExchange:
+        def close(self) -> None:
+            return None
+
+    def build_exchange(exchange, **kwargs):  # noqa: ANN001, ANN003
+        assert exchange == "kalshi"
+        client = FakeKalshiExchange()
+        built_clients.append(client)
+        return client
+
+    manager = MultiplexSubscriptionManager(
+        args=argparse.Namespace(
+            api_base_url="http://127.0.0.1:8011",
+            arb_threshold=0.02,
+            deviation_threshold=0.03,
+            cooldown_seconds=60.0,
+            mapping_refresh_seconds=3600.0,
+            book_stale_seconds=15.0,
+            depth=None,
+            include_expired=False,
+            include_inactive=False,
+            engine="multiplex",
+            debug=True,
+            kalshi_book_mode="poll",
+            multiplex_kalshi_worker_count=2,
+        ),
+        quote_store=QuoteStore(),
+        stop_event=threading.Event(),
+        print_line=lambda line: None,
+        debug=lambda line: None,
+        exchange_builder=build_exchange,
+        on_quote_update=lambda _stream_key: None,
+    )
+
+    client0 = manager._get_client_for_worker(exchange="kalshi", worker_index=0)
+    client1 = manager._get_client_for_worker(exchange="kalshi", worker_index=1)
+
+    assert client0 is client1
+    assert len(built_clients) == 1
 
 
 def test_multiplex_kalshi_watch_auto_falls_back_to_poll_on_rate_limit() -> None:
@@ -1488,7 +1990,7 @@ def test_multiplex_kalshi_watch_auto_falls_back_to_poll_on_rate_limit() -> None:
         print_line=lambda line: lines.append(line),
         debug=lambda line: lines.append(f"[debug] {line}"),
         exchange_builder=lambda exchange, **kwargs: client,
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
 
     try:
@@ -1554,7 +2056,7 @@ def test_multiplex_kalshi_source_mode_hysteresis_delays_return_to_watch() -> Non
         print_line=lambda line: lines.append(line),
         debug=lambda line: lines.append(f"[debug] {line}"),
         exchange_builder=lambda exchange, **kwargs: object(),
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
 
     manager.replace_streams({("kalshi", "KX-1")})
@@ -1611,7 +2113,7 @@ def test_multiplex_rate_limit_backoff_uses_bounded_jitter() -> None:
         print_line=lambda line: None,
         debug=lambda line: None,
         exchange_builder=lambda exchange, **kwargs: object(),
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
 
     started_at = time.time()
@@ -1650,7 +2152,7 @@ def test_multiplex_auth_recovery_policy_is_explicit() -> None:
         print_line=lambda line: lines.append(line),
         debug=lambda line: lines.append(f"[debug] {line}"),
         exchange_builder=lambda exchange, **kwargs: object(),
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
 
     manager._register_auth_error(
@@ -1703,7 +2205,7 @@ def test_multiplex_sidecar_recovery_policy_is_explicit() -> None:
         print_line=lambda line: lines.append(line),
         debug=lambda line: lines.append(f"[debug] {line}"),
         exchange_builder=lambda exchange, **kwargs: object(),
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
 
     manager._register_sidecar_unavailable(
@@ -1756,7 +2258,7 @@ def test_multiplex_rate_limit_storm_policy_is_explicit() -> None:
         print_line=lambda line: lines.append(line),
         debug=lambda line: lines.append(f"[debug] {line}"),
         exchange_builder=lambda exchange, **kwargs: object(),
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
 
     manager._register_rate_limit(
@@ -1816,7 +2318,7 @@ def test_multiplex_dispatch_queue_is_bounded_and_drops_oldest() -> None:
         print_line=lambda line: None,
         debug=lambda line: None,
         exchange_builder=lambda exchange, **kwargs: object(),
-        on_quote_update=lambda: None,
+        on_quote_update=lambda _stream_key: None,
     )
     ingestor = MultiplexExchangeIngestor(manager=manager, exchange="polymarket")
     manager._exchange_ingestors["polymarket"] = ingestor  # type: ignore[attr-defined]
@@ -1922,9 +2424,18 @@ def test_debug_heartbeat_includes_exchange_modes(monkeypatch) -> None:
     runner._last_quote_update_at = heartbeat_now - 1.5
     runner._last_eval_completed_at = heartbeat_now - 2.0
     runner._last_eval_duration_ms = 12.5
+    runner._last_eval_mapping_count = 2
+    runner._last_eval_raw_event_count = 5
     runner._last_eval_due_event_count = 4
     runner._last_eval_emitted_count = 2
     runner._eval_count = 10
+    runner._record_latency_metrics(
+        exchange="kalshi",
+        quote_seen_to_alert_ms=12.0,
+        book_timestamp_to_alert_ms=450.0,
+        exchange_update_to_store_ms=200.0,
+        store_to_alert_ms=25.0,
+    )
 
     runner._emit_debug_heartbeat(heartbeat_now)
 
@@ -1939,6 +2450,8 @@ def test_debug_heartbeat_includes_exchange_modes(monkeypatch) -> None:
     assert any("exchange_queue_depth_counts={'kalshi': 2}" in line for line in lines)
     assert any("exchange_dispatch_drop_counts={'kalshi': 0}" in line for line in lines)
     assert any("last_eval_duration_ms=12.500" in line for line in lines)
+    assert any("last_eval_mapping_count=2" in line for line in lines)
+    assert any("last_eval_raw_event_count=5" in line for line in lines)
     assert any("last_eval_due_event_count=4" in line for line in lines)
     assert any("last_eval_emitted_count=2" in line for line in lines)
     assert any("eval_count=10" in line for line in lines)
@@ -1952,8 +2465,89 @@ def test_debug_heartbeat_includes_exchange_modes(monkeypatch) -> None:
     assert any("exchange_last_ok_age_max_s={'kalshi': 6.0}" in line for line in lines)
     assert any("exchange_latency_p95_ms={'kalshi': 11.0}" in line for line in lines)
     assert any("exchange_latency_max_ms={'kalshi': 11.0}" in line for line in lines)
+    assert any(
+        "quote_seen_to_alert_sample_count={'kalshi': 1, 'overall': 1}" in line for line in lines
+    )
+    assert any(
+        "quote_seen_to_alert_p50_ms={'kalshi': 12.0, 'overall': 12.0}" in line
+        for line in lines
+    )
+    assert any(
+        "book_timestamp_to_alert_p95_ms={'kalshi': 450.0, 'overall': 450.0}" in line
+        for line in lines
+    )
+    assert any(
+        "exchange_update_to_store_p99_ms={'kalshi': 200.0, 'overall': 200.0}" in line
+        for line in lines
+    )
+    assert any(
+        "store_to_alert_p50_ms={'kalshi': 25.0, 'overall': 25.0}" in line for line in lines
+    )
     assert any("last_quote_update_age_s=" in line for line in lines)
     assert any("eval_age_s=" in line for line in lines)
+
+
+def test_debug_heartbeat_splits_latency_metrics_by_source() -> None:
+    module = _load_script_module()
+
+    args = argparse.Namespace(
+        api_base_url="http://127.0.0.1:8011",
+        arb_threshold=0.02,
+        deviation_threshold=0.03,
+        cooldown_seconds=60.0,
+        mapping_refresh_seconds=3600.0,
+        book_stale_seconds=15.0,
+        depth=None,
+        include_expired=False,
+        include_inactive=False,
+        engine="multiplex",
+        debug=True,
+        debug_heartbeat_seconds=10.0,
+        compact_alerts=False,
+        color="never",
+        multiplex_warmup_batch_size=2,
+        multiplex_warmup_interval_seconds=60.0,
+    )
+    runner = module.ArbAlertRunner(args)
+    lines: list[str] = []
+    runner._print_line = lambda line: lines.append(line)  # type: ignore[method-assign]
+    manager = runner._subscription_manager
+    manager._print_line = runner._print_line  # type: ignore[attr-defined]
+
+    runner._record_latency_metrics(
+        exchange="polymarket",
+        source_label="direct_ws_price_change",
+        quote_seen_to_alert_ms=4.0,
+        book_timestamp_to_alert_ms=40.0,
+        exchange_update_to_store_ms=35.0,
+        store_to_alert_ms=1.0,
+    )
+    runner._record_latency_metrics(
+        exchange="polymarket",
+        source_label="quiet_refresh",
+        quote_seen_to_alert_ms=6.0,
+        book_timestamp_to_alert_ms=6000.0,
+        exchange_update_to_store_ms=5990.0,
+        store_to_alert_ms=2.0,
+    )
+
+    runner._emit_debug_heartbeat(time.time())
+
+    assert any(
+        "quote_seen_to_alert_sample_count={'overall': 2, 'polymarket': 2, 'polymarket:direct_ws_price_change': 1, 'polymarket:quiet_refresh': 1}"
+        in line
+        for line in lines
+    )
+    assert any(
+        "book_timestamp_to_alert_p50_ms={'overall': 40.0, 'polymarket': 40.0, 'polymarket:direct_ws_price_change': 40.0, 'polymarket:quiet_refresh': 6000.0}"
+        in line
+        for line in lines
+    )
+    assert any(
+        "exchange_update_to_store_p95_ms={'overall': 5990.0, 'polymarket': 5990.0, 'polymarket:direct_ws_price_change': 35.0, 'polymarket:quiet_refresh': 5990.0}"
+        in line
+        for line in lines
+    )
 
 
 def test_shadow_run_diagnoses_multiplex_only_alert_as_legacy_missing_quotes() -> None:
@@ -2044,6 +2638,22 @@ def test_soak_summary_reports_stream_age_and_mode_events() -> None:
             "exchange_last_ok_age_max_s={'kalshi': 16.0} "
             "exchange_latency_p95_ms={'kalshi': 1800.0} "
             "exchange_latency_max_ms={'kalshi': 1800.0} "
+            "quote_seen_to_alert_sample_count={'kalshi': 2, 'overall': 2} "
+            "quote_seen_to_alert_p50_ms={'kalshi': 12.0, 'overall': 12.0} "
+            "quote_seen_to_alert_p95_ms={'kalshi': 20.0, 'overall': 20.0} "
+            "quote_seen_to_alert_p99_ms={'kalshi': 20.0, 'overall': 20.0} "
+            "book_timestamp_to_alert_sample_count={'kalshi': 2, 'overall': 2} "
+            "book_timestamp_to_alert_p50_ms={'kalshi': 450.0, 'overall': 450.0} "
+            "book_timestamp_to_alert_p95_ms={'kalshi': 800.0, 'overall': 800.0} "
+            "book_timestamp_to_alert_p99_ms={'kalshi': 800.0, 'overall': 800.0} "
+            "exchange_update_to_store_sample_count={'kalshi': 2, 'overall': 2} "
+            "exchange_update_to_store_p50_ms={'kalshi': 200.0, 'overall': 200.0} "
+            "exchange_update_to_store_p95_ms={'kalshi': 350.0, 'overall': 350.0} "
+            "exchange_update_to_store_p99_ms={'kalshi': 350.0, 'overall': 350.0} "
+            "store_to_alert_sample_count={'kalshi': 2, 'overall': 2} "
+            "store_to_alert_p50_ms={'kalshi': 25.0, 'overall': 25.0} "
+            "store_to_alert_p95_ms={'kalshi': 40.0, 'overall': 40.0} "
+            "store_to_alert_p99_ms={'kalshi': 40.0, 'overall': 40.0} "
             "backoffs={} retry_in={'kalshi': 0.0} "
             "rate_limit_counts={'kalshi': 0} sidecar_error_counts={} auth_error_counts={}",
             "[debug] stream exchange=kalshi outcome_id=KX-1 ok=1 err=0 last_latency_ms=1800.0 last_ok_age_s=1.5",
@@ -2075,5 +2685,72 @@ def test_soak_summary_reports_stream_age_and_mode_events() -> None:
     assert summary["exchange_last_ok_age_max_s_max"] == {"kalshi": 16.0}
     assert summary["exchange_latency_p95_ms_max"] == {"kalshi": 1800.0}
     assert summary["exchange_latency_max_ms_max"] == {"kalshi": 1800.0}
+    assert summary["competitive_latency"]["quote_seen_to_alert_ms"]["sample_count"] == {
+        "kalshi": 2,
+        "overall": 2,
+    }
+    assert summary["competitive_latency"]["quote_seen_to_alert_ms"]["p95_ms"] == {
+        "kalshi": 20.0,
+        "overall": 20.0,
+    }
+    assert summary["competitive_latency"]["book_timestamp_to_alert_ms"]["p50_ms"] == {
+        "kalshi": 450.0,
+        "overall": 450.0,
+    }
     assert summary["exchange_mode_events"] == {"kalshi:healthy": 1}
     assert summary["exchange_source_mode_events"] == {"kalshi:watch": 1}
+
+
+def test_benchmark_summary_reports_competitive_latency() -> None:
+    module = _load_named_script_module("ws_arb_benchmark")
+
+    summary = module._summarize(
+        [
+            (
+                0.1,
+                "[debug] heartbeat active_streams=2 quote_count=2 stale_quote_count=0 "
+                "clients=['kalshi'] exchange_source_modes={'kalshi': 'watch'} "
+                "exchange_modes={'kalshi': 'healthy'} exchange_recovery_reasons={} "
+                "exchange_subscription_counts={'kalshi': 2} exchange_active_counts={'kalshi': 2} "
+                "exchange_pending_counts={'kalshi': 0} exchange_priority_counts={'kalshi': 0} "
+                "exchange_queue_depth_counts={'kalshi': 0} exchange_dispatch_drop_counts={'kalshi': 0} "
+                "last_eval_duration_ms=0.200 eval_age_s=0.100 last_eval_mapping_count=1 "
+                "last_eval_raw_event_count=1 last_eval_due_event_count=1 "
+                "last_eval_emitted_count=1 eval_count=1 evals_per_min=10.000 "
+                "quote_update_count=1 quote_updates_since_last_eval=0 last_quote_update_age_s=0.100 "
+                "quote_updates_per_min=10.000 exchange_update_counts={'kalshi': 1} "
+                "exchange_updates_per_min={'kalshi': 10.0} "
+                "exchange_last_ok_age_p95_s={'kalshi': 1.0} "
+                "exchange_last_ok_age_max_s={'kalshi': 1.0} "
+                "exchange_latency_p95_ms={'kalshi': 5.0} exchange_latency_max_ms={'kalshi': 5.0} "
+                "quote_seen_to_alert_sample_count={'kalshi': 1, 'kalshi:watch': 1, 'overall': 1} "
+                "quote_seen_to_alert_p50_ms={'kalshi': 12.0, 'kalshi:watch': 12.0, 'overall': 12.0} "
+                "quote_seen_to_alert_p95_ms={'kalshi': 12.0, 'kalshi:watch': 12.0, 'overall': 12.0} "
+                "quote_seen_to_alert_p99_ms={'kalshi': 12.0, 'kalshi:watch': 12.0, 'overall': 12.0} "
+                "book_timestamp_to_alert_sample_count={'kalshi': 1, 'overall': 1} "
+                "book_timestamp_to_alert_p50_ms={'kalshi': 450.0, 'overall': 450.0} "
+                "book_timestamp_to_alert_p95_ms={'kalshi': 450.0, 'overall': 450.0} "
+                "book_timestamp_to_alert_p99_ms={'kalshi': 450.0, 'overall': 450.0} "
+                "exchange_update_to_store_sample_count={'kalshi': 1, 'overall': 1} "
+                "exchange_update_to_store_p50_ms={'kalshi': 200.0, 'overall': 200.0} "
+                "exchange_update_to_store_p95_ms={'kalshi': 200.0, 'overall': 200.0} "
+                "exchange_update_to_store_p99_ms={'kalshi': 200.0, 'overall': 200.0} "
+                "store_to_alert_sample_count={'kalshi': 1, 'overall': 1} "
+                "store_to_alert_p50_ms={'kalshi': 25.0, 'overall': 25.0} "
+                "store_to_alert_p95_ms={'kalshi': 25.0, 'overall': 25.0} "
+                "store_to_alert_p99_ms={'kalshi': 25.0, 'overall': 25.0} "
+                "backoffs={} retry_in={'kalshi': 0.0} rate_limit_counts={'kalshi': 0} "
+                "sidecar_error_counts={} auth_error_counts={}"
+            )
+        ]
+    )
+
+    assert summary["competitive_latency"]["quote_seen_to_alert_ms"]["p50_ms"] == {
+        "kalshi": 12.0,
+        "kalshi:watch": 12.0,
+        "overall": 12.0,
+    }
+    assert summary["competitive_latency"]["store_to_alert_ms"]["sample_count"] == {
+        "kalshi": 1,
+        "overall": 1,
+    }

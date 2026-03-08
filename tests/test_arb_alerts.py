@@ -4,12 +4,14 @@ import time
 
 from app.arb_alerts import (
     QuoteSnapshot,
+    SemanticMapping,
     build_semantic_mappings,
     evaluate_all_mappings,
     mapping_stream_keys,
     normalize_monitoring_rows,
     passes_cooldown,
 )
+from app.streaming.store import QuoteStore
 
 
 def _pair_details_payload() -> dict:
@@ -272,6 +274,63 @@ def test_stale_quotes_suppress_alerts() -> None:
     assert "cross_market_set_1" not in metrics
     assert "within_kalshi" not in metrics
     assert "same_token_gap_p" not in metrics
+
+
+def test_quote_store_evaluates_only_pairs_affected_by_changed_stream() -> None:
+    now = time.time()
+    mappings = [
+        SemanticMapping(
+            pair_id=1,
+            relation_type="same_direction",
+            kalshi_market_id="KX-1",
+            polymarket_market_id="PM-1",
+            kalshi_p="KX1-YES",
+            kalshi_not_p="KX1-NO",
+            polymarket_p="PM1-YES",
+            polymarket_not_p="PM1-NO",
+        ),
+        SemanticMapping(
+            pair_id=2,
+            relation_type="same_direction",
+            kalshi_market_id="KX-2",
+            polymarket_market_id="PM-2",
+            kalshi_p="KX2-YES",
+            kalshi_not_p="KX2-NO",
+            polymarket_p="PM2-YES",
+            polymarket_not_p="PM2-NO",
+        ),
+    ]
+    store = QuoteStore()
+    store.replace_mappings(
+        mappings,
+        mapping_stream_keys(mappings, canonicalize_kalshi=True),
+    )
+
+    quotes = {
+        ("kalshi", "KX1-YES"): _quote("kalshi", "KX1-YES", 0.60, now),
+        ("kalshi", "KX1-NO"): _quote("kalshi", "KX1-NO", 0.39, now),
+        ("polymarket", "PM1-YES"): _quote("polymarket", "PM1-YES", 0.59, now),
+        ("polymarket", "PM1-NO"): _quote("polymarket", "PM1-NO", 0.38, now),
+        ("kalshi", "KX2-YES"): _quote("kalshi", "KX2-YES", 0.60, now),
+        ("kalshi", "KX2-NO"): _quote("kalshi", "KX2-NO", 0.39, now),
+        ("polymarket", "PM2-YES"): _quote("polymarket", "PM2-YES", 0.59, now),
+        ("polymarket", "PM2-NO"): _quote("polymarket", "PM2-NO", 0.38, now),
+    }
+    for quote in quotes.values():
+        store.upsert_quote(quote)
+
+    result = store.due_alert_events(
+        now=now,
+        arb_threshold=0.02,
+        deviation_threshold=0.03,
+        stale_after_seconds=15.0,
+        cooldown_seconds=0.0,
+        changed_stream_key=("polymarket", "PM1-YES"),
+    )
+
+    assert result.evaluated_mapping_count == 1
+    assert result.raw_event_count > 0
+    assert {item.event.pair_id for item in result.due_events} == {1}
 
 
 def test_passes_cooldown_blocks_repeats_until_window_expires() -> None:

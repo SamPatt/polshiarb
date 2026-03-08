@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
-from datetime import datetime, timezone
 from collections import deque
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 import os
 import random
 import sys
@@ -24,6 +24,7 @@ from app.arb_alerts import (
 )
 from app.kalshi_credentials import build_kalshi_client_kwargs
 
+from .polymarket_ws import PolymarketMarketWebSocketClient
 from .store import QuoteStore
 from .types import DebugFn, ExchangeBuilder, ExchangeIngestor, HealthState, PrintFn, StreamKey
 
@@ -43,6 +44,56 @@ class QueuedQuoteUpdate:
     quote: QuoteSnapshot
     watch_latency_ms: float
     received_at: float
+
+
+class RollingLatencyTracker:
+    def __init__(self, *, sample_limit: int = 4096) -> None:
+        self._sample_limit = max(1, sample_limit)
+        self._samples_by_metric: dict[str, dict[str, deque[float]]] = {}
+
+    def add(
+        self,
+        *,
+        metric_name: str,
+        exchange: str,
+        source_label: str | None,
+        value_ms: float | None,
+    ) -> None:
+        if value_ms is None:
+            return
+        normalized_value = float(value_ms)
+        bucket_names = ["overall", exchange]
+        if source_label:
+            bucket_names.append(f"{exchange}:{source_label}")
+        for bucket_name in bucket_names:
+            metric_samples = self._samples_by_metric.setdefault(metric_name, {})
+            bucket = metric_samples.get(bucket_name)
+            if bucket is None:
+                bucket = deque(maxlen=self._sample_limit)
+                metric_samples[bucket_name] = bucket
+            bucket.append(normalized_value)
+
+    def sample_counts(self, metric_name: str) -> dict[str, int]:
+        metric_samples = self._samples_by_metric.get(metric_name, {})
+        return {
+            bucket_name: len(values)
+            for bucket_name, values in sorted(metric_samples.items())
+            if values
+        }
+
+    def percentile_summary(
+        self,
+        metric_name: str,
+        *,
+        pct: float,
+    ) -> dict[str, float]:
+        metric_samples = self._samples_by_metric.get(metric_name, {})
+        summary: dict[str, float] = {}
+        for bucket_name, values in sorted(metric_samples.items()):
+            percentile_value = _percentile(list(values), pct)
+            if percentile_value is not None:
+                summary[bucket_name] = percentile_value
+        return summary
 
 
 class LegacyExchangeIngestor:
@@ -113,24 +164,54 @@ class MultiplexExchangeIngestor:
             1,
             int(getattr(self._manager.args, "multiplex_dispatch_queue_size", 100)),
         )
-        self._producer_thread = threading.Thread(target=self._run, daemon=True)
+        producer_thread_count = self._manager.producer_thread_count(self.exchange)
+        self._producer_thread_count = producer_thread_count
+        self._producer_threads = [
+            threading.Thread(
+                target=self._run,
+                kwargs={"worker_index": worker_index},
+                daemon=True,
+            )
+            for worker_index in range(producer_thread_count)
+        ]
+        self._auxiliary_threads: list[threading.Thread] = []
+        if self._manager.should_start_direct_quiet_refresh_thread(self.exchange):
+            self._auxiliary_threads.append(
+                threading.Thread(target=self._run_direct_quiet_refresh, daemon=True)
+            )
         self._dispatch_thread = threading.Thread(target=self._run_dispatcher, daemon=True)
 
     def start(self) -> None:
-        self._producer_thread.start()
+        for producer_thread in self._producer_threads:
+            producer_thread.start()
+        for auxiliary_thread in self._auxiliary_threads:
+            auxiliary_thread.start()
         self._dispatch_thread.start()
 
     def stop(self) -> None:
         self._local_stop_event.set()
 
     def join(self, timeout_seconds: float) -> bool:
-        timeout = max(0.0, timeout_seconds)
-        self._producer_thread.join(timeout=timeout)
-        self._dispatch_thread.join(timeout=timeout)
+        deadline = time.time() + max(0.0, timeout_seconds)
+        for producer_thread in self._producer_threads:
+            remaining = max(0.0, deadline - time.time())
+            producer_thread.join(timeout=remaining)
+        for auxiliary_thread in self._auxiliary_threads:
+            remaining = max(0.0, deadline - time.time())
+            auxiliary_thread.join(timeout=remaining)
+        remaining = max(0.0, deadline - time.time())
+        self._dispatch_thread.join(timeout=remaining)
         return not self.is_alive()
 
     def is_alive(self) -> bool:
-        return self._producer_thread.is_alive() or self._dispatch_thread.is_alive()
+        return (
+            any(thread.is_alive() for thread in self._producer_threads)
+            or any(thread.is_alive() for thread in self._auxiliary_threads)
+            or self._dispatch_thread.is_alive()
+        )
+
+    def producer_thread_count(self) -> int:
+        return self._producer_thread_count
 
     def should_stop(self) -> bool:
         return self._manager.stop_event.is_set() or self._local_stop_event.is_set()
@@ -423,8 +504,50 @@ class MultiplexExchangeIngestor:
             )
         return len(requested), len(self._pending_subscriptions)
 
-    def _run(self) -> None:
-        self._manager.worker_loop(self)
+    def disable_outcome_ids(self, outcome_ids: list[str]) -> tuple[int, int]:
+        with self._subscriptions_lock:
+            subscribed_outcomes = set(self._subscriptions) | set(self._pending_subscriptions)
+            disabled_set = {
+                outcome_id for outcome_id in outcome_ids if outcome_id in subscribed_outcomes
+            }
+            if not disabled_set:
+                return 0, len(self._pending_subscriptions)
+
+            self._subscriptions = [
+                outcome_id for outcome_id in self._subscriptions if outcome_id not in disabled_set
+            ]
+            self._pending_subscriptions = deque(
+                outcome_id
+                for outcome_id in self._pending_subscriptions
+                if outcome_id not in disabled_set
+            )
+            for outcome_id in disabled_set:
+                self._active_since.pop(outcome_id, None)
+                self._pending_since.pop(outcome_id, None)
+                self._forced_fetch_outcome_ids.discard(outcome_id)
+            self._priority_subscriptions = deque(
+                outcome_id
+                for outcome_id in self._priority_subscriptions
+                if outcome_id not in disabled_set
+            )
+            if not self._subscriptions:
+                self._cursor = 0
+            else:
+                self._cursor %= len(self._subscriptions)
+
+        with self._dispatch_queue_lock:
+            self._dispatch_queue = deque(
+                quote_update
+                for quote_update in self._dispatch_queue
+                if quote_update.quote.outcome_id not in disabled_set
+            )
+        return len(disabled_set), len(self._pending_subscriptions)
+
+    def _run(self, *, worker_index: int = 0) -> None:
+        self._manager.worker_loop(self, worker_index=worker_index)
+
+    def _run_direct_quiet_refresh(self) -> None:
+        self._manager.direct_quiet_refresh_loop(self)
 
     def _run_dispatcher(self) -> None:
         self._manager.dispatch_loop(self)
@@ -512,7 +635,7 @@ class LegacySubscriptionManager:
         print_line: PrintFn,
         debug: DebugFn,
         exchange_builder: ExchangeBuilder,
-        on_quote_update: Callable[[], None],
+        on_quote_update: Callable[[StreamKey], None],
     ) -> None:
         self.args = args
         self._quote_store = quote_store
@@ -546,6 +669,7 @@ class LegacySubscriptionManager:
         self._next_rate_limit_log_at: dict[StreamKey, float] = {}
         self._next_rate_limit_storm_log_at: dict[str, float] = {}
         self._exchange_clients: dict[str, Any] = {}
+        self._polymarket_ws_client: PolymarketMarketWebSocketClient | None = None
         self._stream_watch_success_count: dict[StreamKey, int] = {}
         self._stream_watch_error_count: dict[StreamKey, int] = {}
         self._stream_last_watch_latency_ms: dict[StreamKey, float] = {}
@@ -560,6 +684,7 @@ class LegacySubscriptionManager:
         self._kalshi_direct_kwargs = build_kalshi_client_kwargs()
         self._use_kalshi_sidecar_default = True
         self._backoff_rng = random.Random(0)
+        self._exchange_worker_clients: dict[tuple[str, int], Any] = {}
 
     def prepare_runtime(self) -> None:
         if bool(getattr(self.args, "kalshi_direct_mode", False)):
@@ -645,7 +770,10 @@ class LegacySubscriptionManager:
             last_ok = dict(self._stream_last_watch_ok_at)
 
         with self._client_lock:
-            client_exchanges = sorted(self._exchange_clients.keys())
+            client_exchanges = sorted(
+                set(self._exchange_clients.keys())
+                | {exchange for exchange, _ in self._exchange_worker_clients.keys()}
+            )
 
         return HealthState(
             active_streams=sorted(self._ingestors.keys()),
@@ -769,25 +897,28 @@ class LegacySubscriptionManager:
                     break
 
                 best_bid, best_ask = extract_best_prices(book)
+                seen_at = time.time()
                 quote = QuoteSnapshot(
                     exchange=exchange,
                     outcome_id=outcome_id,
                     best_bid=best_bid,
                     best_ask=best_ask,
                     book_timestamp_ms=extract_book_timestamp_ms(book),
-                    updated_at=time.time(),
+                    updated_at=seen_at,
+                    quote_seen_at=seen_at,
+                    source_label=self._legacy_quote_source(exchange),
                 )
                 with self._state_lock:
                     self._stream_watch_success_count[stream_key] = (
                         self._stream_watch_success_count.get(stream_key, 0) + 1
                     )
                     self._stream_last_watch_latency_ms[stream_key] = watch_latency_ms
-                    self._stream_last_watch_ok_at[stream_key] = time.time()
+                    self._stream_last_watch_ok_at[stream_key] = seen_at
                 self._quote_store.upsert_quote(quote)
                 self._mark_stream_success(exchange)
                 if ingestor.should_stop():
                     return
-                self._on_quote_update()
+                self._on_quote_update(stream_key)
 
                 time.sleep(self._loop_delay_seconds(exchange))
 
@@ -832,7 +963,16 @@ class LegacySubscriptionManager:
                 return
             time.sleep(min(1.0, retry_not_before - now))
 
-    def _watch_order_book(self, *, client: Any, exchange: str, outcome_id: str) -> Any:
+    def _watch_order_book(
+        self,
+        *,
+        client: Any,
+        exchange: str,
+        outcome_id: str,
+        worker_index: int | None = None,
+    ) -> Any:
+        if self._should_use_worker_scoped_client(exchange=exchange, worker_index=worker_index):
+            return client.watch_order_book(outcome_id, limit=self.args.depth)
         if exchange == "kalshi" and self._kalshi_polling_enabled:
             watch_lock = self._watch_locks.get(exchange)
             if watch_lock is None:
@@ -845,6 +985,11 @@ class LegacySubscriptionManager:
             return client.watch_order_book(outcome_id, limit=self.args.depth)
         with watch_lock:
             return client.watch_order_book(outcome_id, limit=self.args.depth)
+
+    def _legacy_quote_source(self, exchange: str) -> str:
+        if exchange == "kalshi" and self._kalshi_polling_enabled:
+            return "poll"
+        return "watch"
 
     def _loop_delay_seconds(self, exchange: str) -> float:
         if exchange == "kalshi":
@@ -866,7 +1011,79 @@ class LegacySubscriptionManager:
                 )
             return client
 
+    def _should_use_worker_scoped_client(
+        self,
+        *,
+        exchange: str,
+        worker_index: int | None,
+    ) -> bool:
+        return (
+            worker_index is not None
+            and worker_index >= 0
+            and exchange == "kalshi"
+            and self._is_multiplex_engine()
+            and self._current_exchange_source_mode(exchange) == "watch"
+        )
+
+    def _get_exchange_worker_client(self, exchange: str, worker_index: int) -> Any:
+        with self._client_lock:
+            key = (exchange, worker_index)
+            client = self._exchange_worker_clients.get(key)
+            if client is None:
+                client = self._exchange_builder(
+                    exchange,
+                    use_kalshi_sidecar_default=self._use_kalshi_sidecar_default,
+                    kalshi_direct_kwargs=self._kalshi_direct_kwargs,
+                )
+                self._exchange_worker_clients[key] = client
+                self._debug(
+                    "exchange client created "
+                    f"exchange={exchange} worker_index={worker_index} client_id={id(client)}"
+                )
+            return client
+
+    def _get_client_for_worker(
+        self,
+        *,
+        exchange: str,
+        worker_index: int | None,
+    ) -> Any:
+        if self._should_use_worker_scoped_client(exchange=exchange, worker_index=worker_index):
+            assert worker_index is not None
+            return self._get_exchange_worker_client(exchange, worker_index)
+        return self._get_exchange_client(exchange)
+
     def _close_exchange_client(self, exchange: str) -> None:
+        if exchange == "polymarket":
+            with self._client_lock:
+                polymarket_ws_client = self._polymarket_ws_client
+                self._polymarket_ws_client = None
+            if polymarket_ws_client is not None:
+                try:
+                    polymarket_ws_client.close()
+                except Exception:
+                    pass
+                self._debug(
+                    "exchange client closed exchange=polymarket client_id="
+                    f"{id(polymarket_ws_client)}"
+                )
+        with self._client_lock:
+            worker_clients = [
+                ((client_exchange, worker_index), client)
+                for (client_exchange, worker_index), client in self._exchange_worker_clients.items()
+                if client_exchange == exchange
+            ]
+            for key, _ in worker_clients:
+                self._exchange_worker_clients.pop(key, None)
+        for (client_exchange, worker_index), client in worker_clients:
+            try:
+                client.close()
+            except Exception:
+                pass
+            self._debug(
+                "exchange client closed "
+                f"exchange={client_exchange} worker_index={worker_index} client_id={id(client)}"
+            )
         with self._client_lock:
             client = self._exchange_clients.pop(exchange, None)
         if client is None:
@@ -880,8 +1097,51 @@ class LegacySubscriptionManager:
     def _close_all_exchange_clients(self) -> None:
         with self._client_lock:
             exchanges = list(self._exchange_clients.keys())
+            exchanges.extend(
+                exchange
+                for exchange, _ in self._exchange_worker_clients.keys()
+                if exchange not in exchanges
+            )
+            if self._polymarket_ws_client is not None and "polymarket" not in exchanges:
+                exchanges.append("polymarket")
         for exchange in exchanges:
             self._close_exchange_client(exchange)
+
+    def _polymarket_market_ws_url(self) -> str:
+        return str(
+            getattr(
+                self.args,
+                "multiplex_polymarket_market_ws_url",
+                "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+            )
+        )
+
+    def _get_polymarket_ws_client(self) -> PolymarketMarketWebSocketClient:
+        with self._client_lock:
+            client = self._polymarket_ws_client
+            if client is None:
+                client = PolymarketMarketWebSocketClient(
+                    url=self._polymarket_market_ws_url(),
+                    ping_interval_seconds=float(
+                        getattr(
+                            self.args,
+                            "multiplex_polymarket_ping_interval_seconds",
+                            5.0,
+                        )
+                    ),
+                    receive_timeout_seconds=float(
+                        getattr(
+                            self.args,
+                            "multiplex_polymarket_receive_timeout_seconds",
+                            1.0,
+                        )
+                    ),
+                )
+                self._polymarket_ws_client = client
+                self._debug(
+                    f"exchange client created exchange=polymarket client_id={id(client)}"
+                )
+            return client
 
     def _drain_ingestors(self, *, timeout_seconds: float, reason: str) -> None:
         pending = dict(self._ingestors)
@@ -918,6 +1178,10 @@ class LegacySubscriptionManager:
     def _is_auth_token_error(self, exc: Exception) -> bool:
         message = str(exc).lower()
         return "unauthorized" in message and "access token" in message
+
+    def _is_missing_order_book_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "failed to fetch order book" in message and "order not found" in message
 
     def _register_rate_limit(self, *, exchange: str, outcome_id: str, exc: Exception) -> None:
         now = time.time()
@@ -1238,7 +1502,7 @@ class LegacySubscriptionManager:
                 self._exchange_source_mode_hold_until[exchange] = (
                     now + self._source_mode_hysteresis_seconds()
                 )
-            elif mode == "watch":
+            elif mode in {"watch", "direct"}:
                 self._exchange_source_mode_hold_until[exchange] = 0.0
 
         detail = f" reason={reason}"
@@ -1251,13 +1515,27 @@ class LegacySubscriptionManager:
     def _healthy_exchange_source_mode(self, exchange: str) -> str:
         with self._state_lock:
             preferred_mode = self._exchange_source_preference.get(exchange)
-        if preferred_mode in {"watch", "poll"}:
+        if preferred_mode in {"watch", "poll", "direct"}:
             return preferred_mode
+        if exchange == "polymarket":
+            configured_mode = str(
+                getattr(self.args, "multiplex_polymarket_source_mode", "poll")
+            ).lower()
+            if configured_mode == "poll":
+                return "poll"
+            return "direct"
         if exchange == "kalshi" and self._kalshi_book_mode != "poll":
             return "watch"
         return "poll"
 
     def _initial_multiplex_source_mode(self, exchange: str) -> str:
+        if exchange == "polymarket":
+            configured_mode = str(
+                getattr(self.args, "multiplex_polymarket_source_mode", "poll")
+            ).lower()
+            if configured_mode == "poll":
+                return "poll"
+            return "direct"
         if exchange == "kalshi" and self._kalshi_book_mode != "poll":
             return "watch"
         return "poll"
@@ -1265,7 +1543,7 @@ class LegacySubscriptionManager:
     def _current_exchange_source_mode(self, exchange: str) -> str:
         with self._state_lock:
             current_mode = self._exchange_source_mode.get(exchange)
-        if current_mode in {"watch", "poll", "degraded"}:
+        if current_mode in {"watch", "poll", "direct", "degraded"}:
             return current_mode
         return self._healthy_exchange_source_mode(exchange)
 
@@ -1342,7 +1620,7 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
         print_line: PrintFn,
         debug: DebugFn,
         exchange_builder: ExchangeBuilder,
-        on_quote_update: Callable[[], None],
+        on_quote_update: Callable[[StreamKey], None],
     ) -> None:
         super().__init__(
             args=args,
@@ -1361,7 +1639,8 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
         super().prepare_runtime()
         self._print_line(
             "[info] multiplex_orderbook_mode=exchange_level_ingestion "
-            f"kalshi_initial_source_mode={self._initial_multiplex_source_mode('kalshi')}"
+            f"kalshi_initial_source_mode={self._initial_multiplex_source_mode('kalshi')} "
+            f"polymarket_initial_source_mode={self._initial_multiplex_source_mode('polymarket')}"
         )
 
     def warmup_enabled(self, exchange: str) -> bool:
@@ -1376,6 +1655,26 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
         if exchange != "kalshi":
             return 0.0
         return max(0.01, float(getattr(self.args, "multiplex_warmup_interval_seconds", 0.5)))
+
+    def producer_thread_count(self, exchange: str) -> int:
+        if exchange == "kalshi":
+            default_count = 2
+            attr_name = "multiplex_kalshi_worker_count"
+        else:
+            default_count = 1
+            attr_name = "multiplex_polymarket_worker_count"
+        requested_count = max(1, int(getattr(self.args, attr_name, default_count)))
+        if (
+            exchange == "polymarket"
+            and self._initial_multiplex_source_mode(exchange) != "direct"
+            and requested_count > 1
+        ):
+            self._debug(
+                "multiplex worker clamp exchange=polymarket "
+                f"requested={requested_count} effective=1 reason=pmxt_fetch_not_concurrency_safe"
+            )
+            return 1
+        return requested_count
 
     def stale_recovery_seconds(self) -> float:
         default_seconds = max(1.0, float(getattr(self.args, "book_stale_seconds", 15.0)))
@@ -1429,6 +1728,34 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
             int(getattr(self.args, "multiplex_aging_refresh_batch_size", 2)),
         )
 
+    def polymarket_direct_quiet_refresh_seconds(self) -> float:
+        default_seconds = min(
+            max(1.0, float(getattr(self.args, "book_stale_seconds", 15.0))),
+            5.0,
+        )
+        return max(
+            0.5,
+            float(
+                getattr(
+                    self.args,
+                    "multiplex_polymarket_direct_quiet_refresh_seconds",
+                    default_seconds,
+                )
+            ),
+        )
+
+    def polymarket_direct_quiet_refresh_batch_size(self) -> int:
+        return max(
+            1,
+            int(
+                getattr(
+                    self.args,
+                    "multiplex_polymarket_direct_quiet_refresh_batch_size",
+                    5,
+                )
+            ),
+        )
+
     def replace_streams(self, stream_keys: set[StreamKey]) -> bool:
         next_by_exchange: dict[str, set[str]] = {}
         for exchange, outcome_id in stream_keys:
@@ -1476,7 +1803,7 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
                 )
                 ingestor.start()
                 self._debug(
-                    f"multiplex ingestor started exchange={exchange} streams={len(outcome_ids)}"
+                    f"multiplex ingestor started exchange={exchange} streams={len(outcome_ids)} workers={ingestor.producer_thread_count()}"
                 )
                 self._debug(
                     f"multiplex subscriptions updated exchange={exchange} add={len(outcome_ids)} remove=0 keep=0 total={len(outcome_ids)}"
@@ -1568,9 +1895,252 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
             reason=reason,
         )
 
-    def worker_loop(self, ingestor: MultiplexExchangeIngestor) -> None:
+    def _should_use_polymarket_direct_ws(self, exchange: str) -> bool:
+        return exchange == "polymarket" and self._healthy_exchange_source_mode(exchange) == "direct"
+
+    def should_start_direct_quiet_refresh_thread(self, exchange: str) -> bool:
+        return self._should_use_polymarket_direct_ws(exchange)
+
+    def _enqueue_multiplex_quote(
+        self,
+        *,
+        ingestor: MultiplexExchangeIngestor,
+        exchange: str,
+        outcome_id: str,
+        best_bid: float | None,
+        best_ask: float | None,
+        book_timestamp_ms: int | None,
+        received_at: float,
+        source_latency_ms: float | None,
+        source_label: str,
+    ) -> None:
+        quote = QuoteSnapshot(
+            exchange=exchange,
+            outcome_id=outcome_id,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            book_timestamp_ms=book_timestamp_ms,
+            updated_at=received_at,
+            quote_seen_at=received_at,
+            source_label=source_label,
+        )
+        watch_latency_ms = 0.0 if source_latency_ms is None else max(0.0, source_latency_ms)
+        dropped_count = ingestor.enqueue_quote_update(
+            QueuedQuoteUpdate(
+                quote=quote,
+                watch_latency_ms=watch_latency_ms,
+                received_at=received_at,
+            )
+        )
+        if dropped_count > 0:
+            self._debug(
+                f"multiplex dispatch queue dropped exchange={exchange} "
+                f"outcome_id={outcome_id} dropped={dropped_count} "
+                f"depth={ingestor.dispatch_queue_depth()}"
+            )
+
+    def _run_polymarket_direct_loop(self, ingestor: MultiplexExchangeIngestor) -> None:
         exchange = ingestor.exchange
-        self._debug(f"multiplex worker loop entering exchange={exchange}")
+        self._debug("multiplex direct ws loop entering exchange=polymarket")
+
+        while not ingestor.should_stop():
+            desired_outcome_ids = ingestor.outcome_ids()
+            if not desired_outcome_ids:
+                time.sleep(0.05)
+                continue
+
+            try:
+                client = self._get_polymarket_ws_client()
+                add_outcome_ids, remove_outcome_ids = client.sync_subscriptions(desired_outcome_ids)
+                if add_outcome_ids or remove_outcome_ids:
+                    self._debug(
+                        "multiplex direct ws sync exchange=polymarket "
+                        f"add={len(add_outcome_ids)} remove={len(remove_outcome_ids)} "
+                        f"total={len(desired_outcome_ids)}"
+                    )
+                quote_updates = client.recv_quote_updates()
+            except TimeoutError:
+                self._refresh_polymarket_direct_quiet_books(
+                    ingestor=ingestor,
+                    now=time.time(),
+                )
+                continue
+            except Exception as exc:  # pragma: no cover - operational visibility
+                self._print_line(
+                    "[error] multiplex direct ws failure exchange=polymarket "
+                    f"error={exc}"
+                )
+                self._register_exchange_failure(
+                    exchange=exchange,
+                    reason="direct_ws_failure",
+                    recovery_reason="direct_ws_reconnect",
+                )
+                self._close_exchange_client(exchange)
+                time.sleep(1.0)
+                continue
+
+            if not quote_updates:
+                continue
+
+            for quote_update in quote_updates:
+                if quote_update.outcome_id not in desired_outcome_ids:
+                    continue
+                self._enqueue_multiplex_quote(
+                    ingestor=ingestor,
+                    exchange=exchange,
+                    outcome_id=quote_update.outcome_id,
+                    best_bid=quote_update.best_bid,
+                    best_ask=quote_update.best_ask,
+                    book_timestamp_ms=quote_update.book_timestamp_ms,
+                    received_at=quote_update.received_at,
+                    source_latency_ms=quote_update.source_latency_ms,
+                    source_label=quote_update.source_label,
+                )
+
+        self._close_exchange_client(exchange)
+        self._debug("multiplex direct ws loop exiting exchange=polymarket")
+
+    def direct_quiet_refresh_loop(self, ingestor: MultiplexExchangeIngestor) -> None:
+        exchange = ingestor.exchange
+        if not self._should_use_polymarket_direct_ws(exchange):
+            return
+
+        self._debug("multiplex direct quiet refresh loop entering exchange=polymarket")
+        refresh_interval_seconds = min(
+            0.5,
+            max(0.1, self.polymarket_direct_quiet_refresh_seconds() / 4.0),
+        )
+        while not ingestor.should_stop():
+            if not ingestor.outcome_ids():
+                time.sleep(0.05)
+                continue
+            self._refresh_polymarket_direct_quiet_books(
+                ingestor=ingestor,
+                now=time.time(),
+            )
+            time.sleep(refresh_interval_seconds)
+        self._debug("multiplex direct quiet refresh loop exiting exchange=polymarket")
+
+    def _refresh_polymarket_direct_quiet_books(
+        self,
+        *,
+        ingestor: MultiplexExchangeIngestor,
+        now: float,
+    ) -> None:
+        exchange = ingestor.exchange
+        if exchange != "polymarket":
+            return
+
+        refresh_after_seconds = self.polymarket_direct_quiet_refresh_seconds()
+        refresh_batch_size = self.polymarket_direct_quiet_refresh_batch_size()
+        refresh_candidates: list[tuple[int, float, str]] = []
+        with self._state_lock:
+            last_ok = dict(self._stream_last_watch_ok_at)
+            next_recover_at = dict(self._next_stale_recover_at)
+        active_since = ingestor.active_since_by_outcome_id()
+
+        for outcome_id in sorted(ingestor.active_outcome_ids()):
+            stream_key = (exchange, outcome_id)
+            if now < next_recover_at.get(stream_key, 0.0):
+                continue
+            last_ok_at = last_ok.get(stream_key)
+            if last_ok_at is None:
+                active_at = active_since.get(outcome_id)
+                if active_at is None or (now - active_at) < refresh_after_seconds:
+                    continue
+                refresh_candidates.append((0, -(now - active_at), outcome_id))
+                continue
+            age_seconds = now - last_ok_at
+            if age_seconds < refresh_after_seconds:
+                continue
+            refresh_candidates.append((1, -age_seconds, outcome_id))
+
+        if not refresh_candidates:
+            return
+
+        refresh_candidates.sort()
+        selected_outcome_ids = [
+            outcome_id for _, _, outcome_id in refresh_candidates[:refresh_batch_size]
+        ]
+        try:
+            client = self._get_exchange_client(exchange)
+        except Exception:
+            return
+
+        refreshed_count = 0
+        for outcome_id in selected_outcome_ids:
+            try:
+                fetch_started_at = time.time()
+                book = self._fetch_order_book(
+                    client=client,
+                    exchange=exchange,
+                    outcome_id=outcome_id,
+                )
+                source_latency_ms = None
+                book_timestamp_ms = extract_book_timestamp_ms(book)
+                if book_timestamp_ms is not None:
+                    source_latency_ms = (time.time() * 1000.0) - float(book_timestamp_ms)
+                best_bid, best_ask = extract_best_prices(book)
+                self._enqueue_multiplex_quote(
+                    ingestor=ingestor,
+                    exchange=exchange,
+                    outcome_id=outcome_id,
+                    best_bid=best_bid,
+                    best_ask=best_ask,
+                    book_timestamp_ms=book_timestamp_ms,
+                    received_at=time.time(),
+                    source_latency_ms=source_latency_ms,
+                    source_label="quiet_refresh",
+                )
+                with self._state_lock:
+                    self._next_stale_recover_at[(exchange, outcome_id)] = (
+                        now + refresh_after_seconds
+                    )
+                refreshed_count += 1
+                self._debug(
+                    "multiplex direct quiet refresh detail "
+                    f"exchange=polymarket outcome_id={outcome_id} "
+                    f"fetch_ms={(time.time() - fetch_started_at) * 1000.0:.3f}"
+                )
+            except Exception as exc:  # pragma: no cover - operational visibility
+                if self._is_missing_order_book_error(exc):
+                    disabled_count, pending_count = ingestor.disable_outcome_ids([outcome_id])
+                    if disabled_count > 0:
+                        stream_key = (exchange, outcome_id)
+                        self._quote_store.deactivate_streams({stream_key})
+                        self._print_line(
+                            "[warn] disabled invalid order book outcome "
+                            f"exchange={exchange} outcome_id={outcome_id} "
+                            "reason=order_book_not_found"
+                        )
+                        self._debug(
+                            "multiplex direct quiet refresh disabled invalid outcome "
+                            f"exchange={exchange} outcome_id={outcome_id} "
+                            f"remaining={len(ingestor.outcome_ids())} pending={pending_count}"
+                        )
+                continue
+
+        if refreshed_count > 0:
+            self._debug(
+                "multiplex direct quiet refresh exchange=polymarket "
+                f"outcomes={','.join(selected_outcome_ids[:5])} count={refreshed_count} "
+                f"eligible={len(refresh_candidates)}"
+            )
+
+    def worker_loop(
+        self,
+        ingestor: MultiplexExchangeIngestor,
+        *,
+        worker_index: int = 0,
+    ) -> None:
+        exchange = ingestor.exchange
+        self._debug(
+            f"multiplex worker loop entering exchange={exchange} worker_index={worker_index}"
+        )
+
+        if self._should_use_polymarket_direct_ws(exchange):
+            self._run_polymarket_direct_loop(ingestor)
+            return
 
         while not ingestor.should_stop():
             promoted_count, active_count, pending_count = ingestor.release_pending_if_due(
@@ -1599,13 +2169,17 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
             if ingestor.should_stop():
                 return
 
-            client = self._get_exchange_client(exchange)
+            client = self._get_client_for_worker(
+                exchange=exchange,
+                worker_index=worker_index,
+            )
             try:
                 watch_start = time.time()
                 book = self._fetch_multiplex_order_book(
                     client=client,
                     exchange=exchange,
                     outcome_id=outcome_id,
+                    worker_index=worker_index,
                 )
                 watch_latency_ms = (time.time() - watch_start) * 1000.0
             except Exception as exc:  # pragma: no cover - operational visibility
@@ -1649,6 +2223,22 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
                         exchange=exchange,
                     )
                     continue
+                if exchange == "polymarket" and self._is_missing_order_book_error(exc):
+                    disabled_count, pending_count = ingestor.disable_outcome_ids([outcome_id])
+                    if disabled_count > 0:
+                        stream_key = (exchange, outcome_id)
+                        self._quote_store.deactivate_streams({stream_key})
+                        self._print_line(
+                            "[warn] disabled invalid order book outcome "
+                            f"exchange={exchange} outcome_id={outcome_id} "
+                            "reason=order_book_not_found"
+                        )
+                        self._debug(
+                            "multiplex disabled invalid outcome "
+                            f"exchange={exchange} outcome_id={outcome_id} "
+                            f"remaining={len(ingestor.outcome_ids())} pending={pending_count}"
+                        )
+                        continue
                 self._print_line(
                     f"[error] multiplex stream failure exchange={exchange} "
                     f"outcome_id={outcome_id} error={exc}"
@@ -1667,30 +2257,23 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
                 continue
 
             best_bid, best_ask = extract_best_prices(book)
-            quote = QuoteSnapshot(
+            seen_at = time.time()
+            self._enqueue_multiplex_quote(
+                ingestor=ingestor,
                 exchange=exchange,
                 outcome_id=outcome_id,
                 best_bid=best_bid,
                 best_ask=best_ask,
                 book_timestamp_ms=extract_book_timestamp_ms(book),
-                updated_at=time.time(),
+                received_at=seen_at,
+                source_latency_ms=watch_latency_ms,
+                source_label=self._current_exchange_source_mode(exchange),
             )
-            dropped_count = ingestor.enqueue_quote_update(
-                QueuedQuoteUpdate(
-                    quote=quote,
-                    watch_latency_ms=watch_latency_ms,
-                    received_at=time.time(),
-                )
-            )
-            if dropped_count > 0:
-                self._debug(
-                    f"multiplex dispatch queue dropped exchange={exchange} "
-                    f"outcome_id={outcome_id} dropped={dropped_count} "
-                    f"depth={ingestor.dispatch_queue_depth()}"
-                )
             time.sleep(self._loop_delay_seconds(exchange))
 
-        self._debug(f"multiplex worker loop exiting exchange={exchange}")
+        self._debug(
+            f"multiplex worker loop exiting exchange={exchange} worker_index={worker_index}"
+        )
 
     def dispatch_loop(self, ingestor: MultiplexExchangeIngestor) -> None:
         exchange = ingestor.exchange
@@ -1711,13 +2294,21 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
                 self._stream_last_watch_latency_ms[stream_key] = quote_update.watch_latency_ms
                 self._stream_last_watch_ok_at[stream_key] = quote_update.received_at
             ingestor.clear_forced_fetch_outcome_id(quote.outcome_id)
-            self._quote_store.upsert_quote(quote)
+            stored_quote = replace(quote, updated_at=time.time())
+            self._quote_store.upsert_quote(stored_quote)
             self._mark_stream_success(exchange)
-            self._on_quote_update()
+            self._on_quote_update(stream_key)
 
         self._debug(f"multiplex dispatch loop exiting exchange={exchange}")
 
-    def _fetch_multiplex_order_book(self, *, client: Any, exchange: str, outcome_id: str) -> Any:
+    def _fetch_multiplex_order_book(
+        self,
+        *,
+        client: Any,
+        exchange: str,
+        outcome_id: str,
+        worker_index: int | None = None,
+    ) -> Any:
         if exchange == "kalshi" and self._current_exchange_source_mode(exchange) == "watch":
             ingestor = self._exchange_ingestors.get(exchange)
             if ingestor is not None and ingestor.should_force_fetch_outcome_id(outcome_id):
@@ -1725,19 +2316,31 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
                     client=client,
                     exchange=exchange,
                     outcome_id=outcome_id,
+                    worker_index=worker_index,
                 )
-            watch_lock = self._watch_locks.get(exchange)
-            if watch_lock is None:
-                return client.watch_order_book(outcome_id, limit=self.args.depth)
-            with watch_lock:
-                return client.watch_order_book(outcome_id, limit=self.args.depth)
+            return self._watch_order_book(
+                client=client,
+                exchange=exchange,
+                outcome_id=outcome_id,
+                worker_index=worker_index,
+            )
         return self._fetch_order_book(
             client=client,
             exchange=exchange,
             outcome_id=outcome_id,
+            worker_index=worker_index,
         )
 
-    def _fetch_order_book(self, *, client: Any, exchange: str, outcome_id: str) -> Any:
+    def _fetch_order_book(
+        self,
+        *,
+        client: Any,
+        exchange: str,
+        outcome_id: str,
+        worker_index: int | None = None,
+    ) -> Any:
+        if self._should_use_worker_scoped_client(exchange=exchange, worker_index=worker_index):
+            return client.fetch_order_book(outcome_id)
         watch_lock = self._watch_locks.get(exchange)
         if watch_lock is None:
             return client.fetch_order_book(outcome_id)
@@ -1955,9 +2558,12 @@ class ArbAlertRunner:
         self._last_quote_update_at = 0.0
         self._last_eval_completed_at = 0.0
         self._last_eval_duration_ms = 0.0
+        self._last_eval_mapping_count = 0
+        self._last_eval_raw_event_count = 0
         self._last_eval_due_event_count = 0
         self._last_eval_emitted_count = 0
         self._eval_count = 0
+        self._latency_tracker = RollingLatencyTracker()
         self._mapping_subscription_debounce_seconds = max(
             0.0,
             float(getattr(args, "mapping_subscription_debounce_seconds", 0.5)),
@@ -1992,6 +2598,49 @@ class ArbAlertRunner:
                 on_quote_update=self._handle_quote_update,
             )
         return UnsupportedSubscriptionManager(engine=self._engine_name)
+
+    def _record_latency_metrics(
+        self,
+        *,
+        exchange: str,
+        source_label: str | None = None,
+        quote_seen_to_alert_ms: float | None,
+        book_timestamp_to_alert_ms: float | None,
+        exchange_update_to_store_ms: float | None,
+        store_to_alert_ms: float | None,
+    ) -> None:
+        self._latency_tracker.add(
+            metric_name="quote_seen_to_alert_ms",
+            exchange=exchange,
+            source_label=source_label,
+            value_ms=quote_seen_to_alert_ms,
+        )
+        self._latency_tracker.add(
+            metric_name="book_timestamp_to_alert_ms",
+            exchange=exchange,
+            source_label=source_label,
+            value_ms=book_timestamp_to_alert_ms,
+        )
+        self._latency_tracker.add(
+            metric_name="exchange_update_to_store_ms",
+            exchange=exchange,
+            source_label=source_label,
+            value_ms=exchange_update_to_store_ms,
+        )
+        self._latency_tracker.add(
+            metric_name="store_to_alert_ms",
+            exchange=exchange,
+            source_label=source_label,
+            value_ms=store_to_alert_ms,
+        )
+
+    def _latency_metric_fields(self, metric_name: str) -> tuple[dict[str, int], dict[str, float], dict[str, float], dict[str, float]]:
+        return (
+            self._latency_tracker.sample_counts(metric_name),
+            self._latency_tracker.percentile_summary(metric_name, pct=0.50),
+            self._latency_tracker.percentile_summary(metric_name, pct=0.95),
+            self._latency_tracker.percentile_summary(metric_name, pct=0.99),
+        )
 
     def _print_line(self, line: str) -> None:
         with self._print_lock:
@@ -2218,9 +2867,35 @@ class ArbAlertRunner:
             )
         return ("Opportunity detected", "Quote legs unavailable")
 
-    def _format_alert_block(self, event: Any, *, emitted_at: datetime) -> str:
+    def _alert_latency_fields(self, evaluated_event: Any) -> dict[str, str]:
+        fields: dict[str, str] = {}
+        trigger_stream_key = getattr(evaluated_event, "trigger_stream_key", None)
+        if isinstance(trigger_stream_key, tuple) and len(trigger_stream_key) == 2:
+            fields["trigger_exchange"] = str(trigger_stream_key[0])
+            fields["trigger_outcome_id"] = str(trigger_stream_key[1])
+        trigger_quote_source = getattr(evaluated_event, "trigger_quote_source", None)
+        if isinstance(trigger_quote_source, str) and trigger_quote_source:
+            fields["trigger_source"] = trigger_quote_source
+        for field_name in (
+            "quote_seen_to_alert_ms",
+            "book_timestamp_to_alert_ms",
+            "exchange_update_to_store_ms",
+            "store_to_alert_ms",
+        ):
+            raw_value = getattr(evaluated_event, field_name, None)
+            if isinstance(raw_value, (int, float)):
+                fields[field_name] = f"{float(raw_value):.3f}"
+        return fields
+
+    def _format_alert_block(self, evaluated_event: Any, *, emitted_at: datetime) -> str:
+        event = getattr(evaluated_event, "event", evaluated_event)
+        latency_fields = self._alert_latency_fields(evaluated_event)
         if self._compact_alerts:
-            return format_alert_line(event, emitted_at=emitted_at)
+            return format_alert_line(
+                event,
+                emitted_at=emitted_at,
+                extra_fields=latency_fields,
+            )
 
         summary, legs = self._metric_summary(event)
         value = self._colorize(f"{event.metric_value:.4f}", "1;32")
@@ -2240,6 +2915,11 @@ class ArbAlertRunner:
         metric = self._colorize(event.metric_name, "35")
         relation = self._colorize(event.relation_type, "36")
         divider = self._colorize("-" * 96, "2")
+        latency_line = "  Latency: unavailable"
+        if latency_fields:
+            latency_line = "  Latency: " + " ".join(
+                f"{key}={value}" for key, value in sorted(latency_fields.items())
+            )
 
         return "\n".join(
             [
@@ -2252,6 +2932,7 @@ class ArbAlertRunner:
                 f"  Markets: {self._colorize(markets, '2')}",
                 f"  Outcomes: {outcomes}",
                 f"  Legs: {legs}",
+                latency_line,
                 "  Note: Informational top-of-book signal only (fees, depth, and execution risk excluded).",
                 divider,
             ]
@@ -2300,6 +2981,30 @@ class ArbAlertRunner:
             if p95_latency is not None:
                 exchange_latency_p95_ms[exchange] = p95_latency
                 exchange_latency_max_ms[exchange] = max(latencies)
+        (
+            quote_seen_to_alert_sample_count,
+            quote_seen_to_alert_p50_ms,
+            quote_seen_to_alert_p95_ms,
+            quote_seen_to_alert_p99_ms,
+        ) = self._latency_metric_fields("quote_seen_to_alert_ms")
+        (
+            book_timestamp_to_alert_sample_count,
+            book_timestamp_to_alert_p50_ms,
+            book_timestamp_to_alert_p95_ms,
+            book_timestamp_to_alert_p99_ms,
+        ) = self._latency_metric_fields("book_timestamp_to_alert_ms")
+        (
+            exchange_update_to_store_sample_count,
+            exchange_update_to_store_p50_ms,
+            exchange_update_to_store_p95_ms,
+            exchange_update_to_store_p99_ms,
+        ) = self._latency_metric_fields("exchange_update_to_store_ms")
+        (
+            store_to_alert_sample_count,
+            store_to_alert_p50_ms,
+            store_to_alert_p95_ms,
+            store_to_alert_p99_ms,
+        ) = self._latency_metric_fields("store_to_alert_ms")
         self._debug(
             "heartbeat "
             f"active_streams={len(health.active_streams)} quote_count={health.quote_count} "
@@ -2314,6 +3019,8 @@ class ArbAlertRunner:
             f"exchange_queue_depth_counts={health.exchange_queue_depth_counts} "
             f"exchange_dispatch_drop_counts={health.exchange_dispatch_drop_counts} "
             f"last_eval_duration_ms={self._last_eval_duration_ms:.3f} eval_age_s={eval_age_s} "
+            f"last_eval_mapping_count={self._last_eval_mapping_count} "
+            f"last_eval_raw_event_count={self._last_eval_raw_event_count} "
             f"last_eval_due_event_count={self._last_eval_due_event_count} "
             f"last_eval_emitted_count={self._last_eval_emitted_count} "
             f"eval_count={self._eval_count} evals_per_min={evals_per_min:.3f} "
@@ -2327,6 +3034,22 @@ class ArbAlertRunner:
             f"exchange_last_ok_age_max_s={exchange_last_ok_age_max_s} "
             f"exchange_latency_p95_ms={exchange_latency_p95_ms} "
             f"exchange_latency_max_ms={exchange_latency_max_ms} "
+            f"quote_seen_to_alert_sample_count={quote_seen_to_alert_sample_count} "
+            f"quote_seen_to_alert_p50_ms={quote_seen_to_alert_p50_ms} "
+            f"quote_seen_to_alert_p95_ms={quote_seen_to_alert_p95_ms} "
+            f"quote_seen_to_alert_p99_ms={quote_seen_to_alert_p99_ms} "
+            f"book_timestamp_to_alert_sample_count={book_timestamp_to_alert_sample_count} "
+            f"book_timestamp_to_alert_p50_ms={book_timestamp_to_alert_p50_ms} "
+            f"book_timestamp_to_alert_p95_ms={book_timestamp_to_alert_p95_ms} "
+            f"book_timestamp_to_alert_p99_ms={book_timestamp_to_alert_p99_ms} "
+            f"exchange_update_to_store_sample_count={exchange_update_to_store_sample_count} "
+            f"exchange_update_to_store_p50_ms={exchange_update_to_store_p50_ms} "
+            f"exchange_update_to_store_p95_ms={exchange_update_to_store_p95_ms} "
+            f"exchange_update_to_store_p99_ms={exchange_update_to_store_p99_ms} "
+            f"store_to_alert_sample_count={store_to_alert_sample_count} "
+            f"store_to_alert_p50_ms={store_to_alert_p50_ms} "
+            f"store_to_alert_p95_ms={store_to_alert_p95_ms} "
+            f"store_to_alert_p99_ms={store_to_alert_p99_ms} "
             f"backoffs={health.backoffs} "
             f"retry_in={health.retry_windows} rate_limit_counts={health.rate_limit_counts} "
             f"sidecar_error_counts={health.sidecar_error_counts} "
@@ -2344,22 +3067,34 @@ class ArbAlertRunner:
                 f"last_ok_age_s={ok_age if ok_age is not None else 'na'}"
             )
 
-    def _evaluate_and_emit(self) -> None:
+    def _evaluate_and_emit(self, *, changed_stream_key: StreamKey | None = None) -> None:
         if self.stop_event.is_set():
             return
         eval_started_at = time.time()
         now = eval_started_at
         emitted_at = datetime.fromtimestamp(now, tz=timezone.utc)
-        events = self._store.due_alert_events(
+        evaluation = self._store.due_alert_events(
             now=now,
             arb_threshold=self.args.arb_threshold,
             deviation_threshold=self.args.deviation_threshold,
             stale_after_seconds=self.args.book_stale_seconds,
             cooldown_seconds=self.args.cooldown_seconds,
+            changed_stream_key=changed_stream_key,
         )
-        self._last_eval_due_event_count = len(events)
+        self._last_eval_mapping_count = evaluation.evaluated_mapping_count
+        self._last_eval_raw_event_count = evaluation.raw_event_count
+        self._last_eval_due_event_count = len(evaluation.due_events)
+        if evaluation.trigger_stream_key is not None:
+            self._record_latency_metrics(
+                exchange=evaluation.trigger_stream_key[0],
+                source_label=evaluation.trigger_quote_source,
+                quote_seen_to_alert_ms=evaluation.quote_seen_to_alert_ms,
+                book_timestamp_to_alert_ms=evaluation.book_timestamp_to_alert_ms,
+                exchange_update_to_store_ms=evaluation.exchange_update_to_store_ms,
+                store_to_alert_ms=evaluation.store_to_alert_ms,
+            )
         emitted_count = 0
-        for event in events:
+        for event in evaluation.due_events:
             self._print_line(self._format_alert_block(event, emitted_at=emitted_at))
             emitted_count += 1
         self._last_eval_completed_at = time.time()
@@ -2368,11 +3103,11 @@ class ArbAlertRunner:
         self._quote_updates_since_last_eval = 0
         self._eval_count += 1
 
-    def _handle_quote_update(self) -> None:
+    def _handle_quote_update(self, stream_key: StreamKey) -> None:
         self._quote_update_count += 1
         self._quote_updates_since_last_eval += 1
         self._last_quote_update_at = time.time()
-        self._evaluate_and_emit()
+        self._evaluate_and_emit(changed_stream_key=stream_key)
 
     def run(self) -> int:
         try:

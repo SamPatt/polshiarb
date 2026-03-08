@@ -18,6 +18,12 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+LATENCY_FIELD_ROOTS = (
+    ("quote_seen_to_alert_ms", "quote_seen_to_alert"),
+    ("book_timestamp_to_alert_ms", "book_timestamp_to_alert"),
+    ("exchange_update_to_store_ms", "exchange_update_to_store"),
+    ("store_to_alert_ms", "store_to_alert"),
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -68,6 +74,24 @@ def _parse_args() -> argparse.Namespace:
         help="Optional explicit Kalshi book mode override.",
     )
     parser.add_argument(
+        "--multiplex-kalshi-worker-count",
+        type=int,
+        default=None,
+        help="Optional Kalshi multiplex worker override passed to ws_arb_alerts.py.",
+    )
+    parser.add_argument(
+        "--multiplex-polymarket-worker-count",
+        type=int,
+        default=None,
+        help="Optional Polymarket multiplex worker override passed to ws_arb_alerts.py.",
+    )
+    parser.add_argument(
+        "--multiplex-polymarket-source-mode",
+        choices=("direct", "poll"),
+        default=None,
+        help="Optional Polymarket multiplex source mode override passed to ws_arb_alerts.py.",
+    )
+    parser.add_argument(
         "--output-json",
         type=Path,
         default=None,
@@ -102,6 +126,27 @@ def _build_command(args: argparse.Namespace) -> list[str]:
         command.append("--kalshi-direct-mode")
     if args.kalshi_book_mode:
         command.extend(["--kalshi-book-mode", args.kalshi_book_mode])
+    if args.multiplex_kalshi_worker_count is not None:
+        command.extend(
+            [
+                "--multiplex-kalshi-worker-count",
+                str(args.multiplex_kalshi_worker_count),
+            ]
+        )
+    if args.multiplex_polymarket_worker_count is not None:
+        command.extend(
+            [
+                "--multiplex-polymarket-worker-count",
+                str(args.multiplex_polymarket_worker_count),
+            ]
+        )
+    if args.multiplex_polymarket_source_mode:
+        command.extend(
+            [
+                "--multiplex-polymarket-source-mode",
+                args.multiplex_polymarket_source_mode,
+            ]
+        )
     return command
 
 
@@ -164,6 +209,27 @@ def _parse_key_values(payload: str) -> dict[str, Any]:
     return fields
 
 
+def _competitive_latency_report(heartbeat: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(heartbeat, dict):
+        return {}
+
+    report: dict[str, Any] = {}
+    for metric_name, field_root in LATENCY_FIELD_ROOTS:
+        sample_count = heartbeat.get(f"{field_root}_sample_count")
+        p50_ms = heartbeat.get(f"{field_root}_p50_ms")
+        p95_ms = heartbeat.get(f"{field_root}_p95_ms")
+        p99_ms = heartbeat.get(f"{field_root}_p99_ms")
+        if not any(isinstance(value, dict) and value for value in (sample_count, p50_ms, p95_ms, p99_ms)):
+            continue
+        report[metric_name] = {
+            "sample_count": sample_count if isinstance(sample_count, dict) else {},
+            "p50_ms": p50_ms if isinstance(p50_ms, dict) else {},
+            "p95_ms": p95_ms if isinstance(p95_ms, dict) else {},
+            "p99_ms": p99_ms if isinstance(p99_ms, dict) else {},
+        }
+    return report
+
+
 def _summarize(lines: list[tuple[float, str]]) -> dict[str, Any]:
     raw_lines = [line for _, line in lines]
     alert_lines = [line for line in raw_lines if line.startswith("[ALERT_")]
@@ -220,6 +286,7 @@ def _summarize(lines: list[tuple[float, str]]) -> dict[str, Any]:
         "startup_metrics": startup_metrics,
         "heartbeat_count": len(heartbeats),
         "last_heartbeat": heartbeats[-1] if heartbeats else None,
+        "competitive_latency": _competitive_latency_report(heartbeats[-1] if heartbeats else None),
         "raw_lines": raw_lines,
     }
 

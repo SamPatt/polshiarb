@@ -16,6 +16,12 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BENCHMARK_SCRIPT = REPO_ROOT / "scripts" / "ws_arb_benchmark.py"
+LATENCY_FIELD_ROOTS = (
+    ("quote_seen_to_alert_ms", "quote_seen_to_alert"),
+    ("book_timestamp_to_alert_ms", "book_timestamp_to_alert"),
+    ("exchange_update_to_store_ms", "exchange_update_to_store"),
+    ("store_to_alert_ms", "store_to_alert"),
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -81,6 +87,24 @@ def _parse_args() -> argparse.Namespace:
         choices=("auto", "watch", "poll"),
         default=None,
         help="Optional explicit Kalshi book mode override.",
+    )
+    parser.add_argument(
+        "--multiplex-kalshi-worker-count",
+        type=int,
+        default=None,
+        help="Optional Kalshi multiplex worker override passed through to the runner.",
+    )
+    parser.add_argument(
+        "--multiplex-polymarket-worker-count",
+        type=int,
+        default=None,
+        help="Optional Polymarket multiplex worker override passed through to the runner.",
+    )
+    parser.add_argument(
+        "--multiplex-polymarket-source-mode",
+        choices=("direct", "poll"),
+        default=None,
+        help="Optional Polymarket multiplex source mode override passed through to the runner.",
     )
     parser.add_argument(
         "--output-json",
@@ -158,6 +182,27 @@ def _percentile(values: list[float], pct: float) -> float | None:
         return ordered[0]
     idx = int(round((len(ordered) - 1) * pct))
     return ordered[max(0, min(len(ordered) - 1, idx))]
+
+
+def _competitive_latency_report(heartbeat: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(heartbeat, dict):
+        return {}
+
+    report: dict[str, Any] = {}
+    for metric_name, field_root in LATENCY_FIELD_ROOTS:
+        sample_count = heartbeat.get(f"{field_root}_sample_count")
+        p50_ms = heartbeat.get(f"{field_root}_p50_ms")
+        p95_ms = heartbeat.get(f"{field_root}_p95_ms")
+        p99_ms = heartbeat.get(f"{field_root}_p99_ms")
+        if not any(isinstance(value, dict) and value for value in (sample_count, p50_ms, p95_ms, p99_ms)):
+            continue
+        report[metric_name] = {
+            "sample_count": sample_count if isinstance(sample_count, dict) else {},
+            "p50_ms": p50_ms if isinstance(p50_ms, dict) else {},
+            "p95_ms": p95_ms if isinstance(p95_ms, dict) else {},
+            "p99_ms": p99_ms if isinstance(p99_ms, dict) else {},
+        }
+    return report
 
 
 def _max_nested_numeric_dicts(
@@ -388,6 +433,9 @@ def _summarize_log_lines(
         "exchange_mode_events": dict(sorted(exchange_mode_events.items())),
         "exchange_source_mode_events": dict(sorted(exchange_source_mode_events.items())),
         "exchange_recovery_events": dict(sorted(exchange_recovery_events.items())),
+        "competitive_latency": _competitive_latency_report(
+            snapshots[-1]["heartbeat"] if snapshots else None
+        ),
         "snapshots": snapshots,
     }
 
@@ -422,6 +470,27 @@ def _run_benchmark(
         command.append("--kalshi-direct-mode")
     if args.kalshi_book_mode:
         command.extend(["--kalshi-book-mode", args.kalshi_book_mode])
+    if args.multiplex_kalshi_worker_count is not None:
+        command.extend(
+            [
+                "--multiplex-kalshi-worker-count",
+                str(args.multiplex_kalshi_worker_count),
+            ]
+        )
+    if args.multiplex_polymarket_worker_count is not None:
+        command.extend(
+            [
+                "--multiplex-polymarket-worker-count",
+                str(args.multiplex_polymarket_worker_count),
+            ]
+        )
+    if args.multiplex_polymarket_source_mode:
+        command.extend(
+            [
+                "--multiplex-polymarket-source-mode",
+                args.multiplex_polymarket_source_mode,
+            ]
+        )
 
     result = subprocess.run(
         command,
