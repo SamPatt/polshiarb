@@ -666,6 +666,7 @@ class LegacySubscriptionManager:
         self._exchange_mode_hold_until: dict[str, float] = {}
         self._exchange_recovery_reason: dict[str, str] = {}
         self._exchange_consecutive_failure_count: dict[str, int] = {}
+        self._exchange_success_streak_count: dict[str, int] = {}
         self._next_rate_limit_log_at: dict[StreamKey, float] = {}
         self._next_rate_limit_storm_log_at: dict[str, float] = {}
         self._exchange_clients: dict[str, Any] = {}
@@ -1188,6 +1189,7 @@ class LegacySubscriptionManager:
         with self._state_lock:
             next_count = self._exchange_rate_limit_count.get(exchange, 0) + 1
             self._exchange_rate_limit_count[exchange] = next_count
+            self._exchange_success_streak_count[exchange] = 0
             is_storm = next_count >= self._rate_limit_storm_threshold()
             previous_backoff = self._exchange_backoff_seconds.get(exchange, 1.0)
             next_backoff = min(max(previous_backoff * 2.0, 2.0), 60.0)
@@ -1383,16 +1385,51 @@ class LegacySubscriptionManager:
             )
 
     def _mark_stream_success(self, exchange: str) -> None:
+        now = time.time()
+        healthy_source_mode = self._healthy_exchange_source_mode(exchange)
+        should_clear_exchange_failure = True
         with self._state_lock:
+            next_success_streak = self._exchange_success_streak_count.get(exchange, 0) + 1
+            self._exchange_success_streak_count[exchange] = next_success_streak
+            current_source_mode = self._exchange_source_mode.get(exchange)
+            retry_not_before = self._exchange_retry_not_before.get(exchange, 0.0)
+            rate_limit_count = self._exchange_rate_limit_count.get(exchange, 0)
+            recovery_reason = self._exchange_recovery_reason.get(exchange)
+            rate_limited_recovery = rate_limit_count > 0 or recovery_reason in {
+                "rate_limit_backoff",
+                "rate_limit_storm_backoff",
+            }
+            if (
+                exchange == "kalshi"
+                and healthy_source_mode == "watch"
+                and current_source_mode == "degraded"
+                and rate_limited_recovery
+            ):
+                required_successes = max(
+                    1,
+                    int(
+                        getattr(
+                            self.args,
+                            "multiplex_kalshi_successes_to_restore_watch",
+                            3,
+                        )
+                    ),
+                )
+                should_clear_exchange_failure = (
+                    retry_not_before <= now and next_success_streak >= required_successes
+                )
+            if not should_clear_exchange_failure:
+                return
             if self._exchange_backoff_seconds.get(exchange, 1.0) > 1.0:
                 self._exchange_backoff_seconds[exchange] = 1.0
             self._exchange_retry_not_before[exchange] = 0.0
             self._exchange_consecutive_failure_count[exchange] = 0
             self._exchange_rate_limit_count[exchange] = 0
+            self._exchange_success_streak_count[exchange] = 0
             self._exchange_recovery_reason.pop(exchange, None)
         self._set_exchange_source_mode(
             exchange=exchange,
-            mode=self._healthy_exchange_source_mode(exchange),
+            mode=healthy_source_mode,
             reason="stream_ok",
         )
         self._set_exchange_mode(
@@ -1702,6 +1739,20 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
             int(getattr(self.args, "multiplex_stale_recovery_batch_size", 5)),
         )
 
+    def effective_stale_recovery_batch_size(
+        self,
+        *,
+        exchange: str,
+        candidate_count: int,
+    ) -> int:
+        base_size = self.stale_recovery_batch_size()
+        if exchange != "kalshi":
+            return base_size
+        return max(
+            base_size,
+            min(candidate_count, max(1, self.producer_thread_count(exchange)) * base_size),
+        )
+
     def aging_refresh_seconds(self) -> float:
         default_seconds = max(0.25, self.stale_recovery_seconds() * 0.7)
         configured_value = getattr(self.args, "multiplex_aging_refresh_seconds", default_seconds)
@@ -1726,6 +1777,20 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
         return max(
             1,
             int(getattr(self.args, "multiplex_aging_refresh_batch_size", 2)),
+        )
+
+    def effective_aging_refresh_batch_size(
+        self,
+        *,
+        exchange: str,
+        candidate_count: int,
+    ) -> int:
+        base_size = self.aging_refresh_batch_size()
+        if exchange != "kalshi":
+            return base_size
+        return max(
+            base_size,
+            min(candidate_count, max(1, self.producer_thread_count(exchange)) * base_size),
         )
 
     def polymarket_direct_quiet_refresh_seconds(self) -> float:
@@ -2412,12 +2477,16 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
         current_source_mode = self._current_exchange_source_mode(exchange)
         used_forced_fetch = exchange == "kalshi" and current_source_mode == "watch"
         stale_candidates.sort()
+        base_recovery_budget = self.effective_stale_recovery_batch_size(
+            exchange=exchange,
+            candidate_count=len(stale_candidates),
+        )
         if used_forced_fetch:
-            recovery_budget = self.stale_recovery_batch_size()
+            recovery_budget = base_recovery_budget
         else:
             recovery_budget = max(
                 0,
-                self.stale_recovery_batch_size() - len(ingestor.priority_outcome_ids()),
+                base_recovery_budget - len(ingestor.priority_outcome_ids()),
             )
         if recovery_budget <= 0:
             return
@@ -2500,9 +2569,13 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
         if not aging_candidates:
             return
 
+        base_refresh_budget = self.effective_aging_refresh_batch_size(
+            exchange=exchange,
+            candidate_count=len(aging_candidates),
+        )
         refresh_budget = max(
             0,
-            self.aging_refresh_batch_size() - len(ingestor.priority_outcome_ids()),
+            base_refresh_budget - len(ingestor.priority_outcome_ids()),
         )
         if refresh_budget <= 0:
             return

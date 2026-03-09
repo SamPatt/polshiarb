@@ -2128,6 +2128,73 @@ def test_multiplex_rate_limit_backoff_uses_bounded_jitter() -> None:
     assert retry_delay != pytest.approx(2.0, rel=1e-6)
 
 
+def test_multiplex_kalshi_rate_limit_recovery_requires_success_streak() -> None:
+    lines: list[str] = []
+    stop_event = threading.Event()
+    stop_event.set()
+    manager = MultiplexSubscriptionManager(
+        args=argparse.Namespace(
+            api_base_url="http://127.0.0.1:8011",
+            arb_threshold=0.02,
+            deviation_threshold=0.03,
+            cooldown_seconds=60.0,
+            mapping_refresh_seconds=3600.0,
+            book_stale_seconds=15.0,
+            depth=None,
+            include_expired=False,
+            include_inactive=False,
+            engine="multiplex",
+            debug=True,
+            kalshi_book_mode="auto",
+            multiplex_degraded_failure_threshold=1,
+            multiplex_mode_hysteresis_seconds=0.0,
+            multiplex_backoff_jitter_ratio=0.0,
+            multiplex_kalshi_successes_to_restore_watch=3,
+        ),
+        quote_store=QuoteStore(),
+        stop_event=stop_event,
+        print_line=lambda line: lines.append(line),
+        debug=lambda line: lines.append(f"[debug] {line}"),
+        exchange_builder=lambda exchange, **kwargs: object(),
+        on_quote_update=lambda _stream_key: None,
+    )
+
+    manager.replace_streams({("kalshi", "KX-1")})
+    manager._register_rate_limit(
+        exchange="kalshi",
+        outcome_id="KX-1",
+        exc=RuntimeError("429 too many requests"),
+    )
+    with manager._state_lock:
+        manager._exchange_retry_not_before["kalshi"] = time.time() - 1.0
+
+    health = manager.health_state(now=time.time())
+    assert health.exchange_source_modes["kalshi"] == "degraded"
+    assert health.rate_limit_counts["kalshi"] == 1
+
+    manager._mark_stream_success("kalshi")
+    health = manager.health_state(now=time.time())
+    assert health.exchange_source_modes["kalshi"] == "degraded"
+    assert health.exchange_modes["kalshi"] == "degraded"
+    assert health.rate_limit_counts["kalshi"] == 1
+
+    manager._mark_stream_success("kalshi")
+    health = manager.health_state(now=time.time())
+    assert health.exchange_source_modes["kalshi"] == "degraded"
+    assert health.exchange_modes["kalshi"] == "degraded"
+    assert health.rate_limit_counts["kalshi"] == 1
+
+    manager._mark_stream_success("kalshi")
+    health = manager.health_state(now=time.time())
+    assert health.exchange_source_modes["kalshi"] == "watch"
+    assert health.exchange_modes["kalshi"] == "healthy"
+    assert health.rate_limit_counts["kalshi"] == 0
+    assert any(
+        "exchange_source_mode exchange=kalshi mode=watch reason=stream_ok" in line
+        for line in lines
+    )
+
+
 def test_multiplex_auth_recovery_policy_is_explicit() -> None:
     lines: list[str] = []
     args = argparse.Namespace(
@@ -2294,6 +2361,64 @@ def test_multiplex_rate_limit_storm_policy_is_explicit() -> None:
     assert health.exchange_modes["polymarket"] == "healthy"
     assert "polymarket" not in health.exchange_recovery_reasons
     assert manager._exchange_rate_limit_count["polymarket"] == 0
+
+
+def test_multiplex_kalshi_recovery_budgets_scale_with_worker_capacity() -> None:
+    args = argparse.Namespace(
+        api_base_url="http://127.0.0.1:8011",
+        arb_threshold=0.02,
+        deviation_threshold=0.03,
+        cooldown_seconds=60.0,
+        mapping_refresh_seconds=3600.0,
+        book_stale_seconds=15.0,
+        depth=None,
+        include_expired=False,
+        include_inactive=False,
+        engine="multiplex",
+        debug=False,
+        kalshi_book_mode="auto",
+        multiplex_stale_recovery_batch_size=2,
+        multiplex_aging_refresh_batch_size=2,
+        multiplex_kalshi_worker_count=2,
+    )
+    manager = MultiplexSubscriptionManager(
+        args=args,
+        quote_store=QuoteStore(),
+        stop_event=threading.Event(),
+        print_line=lambda line: None,
+        debug=lambda line: None,
+        exchange_builder=lambda exchange, **kwargs: object(),
+        on_quote_update=lambda _stream_key: None,
+    )
+    ingestor = MultiplexExchangeIngestor(manager=manager, exchange="kalshi")
+    outcome_ids = {f"KX-{idx}" for idx in range(6)}
+    ingestor.replace_subscriptions(outcome_ids)
+
+    now = time.time()
+    with manager._state_lock:
+        for outcome_id in outcome_ids:
+            manager._stream_last_watch_ok_at[("kalshi", outcome_id)] = now - 20.0
+
+    manager._recover_stale_outcomes(
+        exchange="kalshi",
+        ingestor=ingestor,
+        now=now,
+    )
+    assert len(ingestor.forced_fetch_outcome_ids()) == 4
+
+    ingestor = MultiplexExchangeIngestor(manager=manager, exchange="kalshi")
+    ingestor.replace_subscriptions(outcome_ids)
+    with manager._state_lock:
+        manager._next_aging_refresh_at.clear()
+        for outcome_id in outcome_ids:
+            manager._stream_last_watch_ok_at[("kalshi", outcome_id)] = now - 12.0
+
+    manager._promote_aging_outcomes(
+        exchange="kalshi",
+        ingestor=ingestor,
+        now=now,
+    )
+    assert len(ingestor.forced_fetch_outcome_ids()) == 4
 
 
 def test_multiplex_dispatch_queue_is_bounded_and_drops_oldest() -> None:
