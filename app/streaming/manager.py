@@ -439,6 +439,25 @@ class MultiplexExchangeIngestor:
     def enqueue_quote_update(self, quote_update: QueuedQuoteUpdate) -> int:
         dropped_count = 0
         with self._dispatch_queue_lock:
+            incoming_exchange = quote_update.quote.exchange
+            incoming_outcome_id = quote_update.quote.outcome_id
+            incoming_source_label = quote_update.quote.source_label
+            for idx, queued_update in enumerate(self._dispatch_queue):
+                queued_quote = queued_update.quote
+                if (
+                    queued_quote.exchange != incoming_exchange
+                    or queued_quote.outcome_id != incoming_outcome_id
+                ):
+                    continue
+                queued_source_label = queued_quote.source_label
+                if (
+                    incoming_source_label == "quiet_refresh"
+                    and queued_source_label != "quiet_refresh"
+                ):
+                    return 0
+                del self._dispatch_queue[idx]
+                self._dispatch_queue.append(quote_update)
+                return 0
             if len(self._dispatch_queue) >= self._dispatch_queue_capacity:
                 drop_index = None
                 if quote_update.quote.source_label != "quiet_refresh":
