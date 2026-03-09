@@ -279,6 +279,9 @@ class MultiplexExchangeIngestor:
         with self._dispatch_queue_lock:
             return len(self._dispatch_queue)
 
+    def dispatch_queue_capacity(self) -> int:
+        return self._dispatch_queue_capacity
+
     def dropped_dispatch_count(self) -> int:
         with self._dispatch_queue_lock:
             return self._dropped_dispatch_count
@@ -437,7 +440,16 @@ class MultiplexExchangeIngestor:
         dropped_count = 0
         with self._dispatch_queue_lock:
             if len(self._dispatch_queue) >= self._dispatch_queue_capacity:
-                self._dispatch_queue.popleft()
+                drop_index = None
+                if quote_update.quote.source_label != "quiet_refresh":
+                    for idx, queued_update in enumerate(self._dispatch_queue):
+                        if queued_update.quote.source_label == "quiet_refresh":
+                            drop_index = idx
+                            break
+                if drop_index is None:
+                    self._dispatch_queue.popleft()
+                else:
+                    del self._dispatch_queue[drop_index]
                 self._dropped_dispatch_count += 1
                 dropped_count = 1
             self._dispatch_queue.append(quote_update)
@@ -2066,6 +2078,19 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
             ),
         )
 
+    def polymarket_direct_quiet_refresh_queue_depth_limit(
+        self,
+        ingestor: MultiplexExchangeIngestor,
+    ) -> int:
+        configured_limit = getattr(
+            self.args,
+            "multiplex_polymarket_direct_quiet_refresh_queue_depth_limit",
+            None,
+        )
+        if configured_limit is not None:
+            return max(1, int(configured_limit))
+        return max(1, ingestor.dispatch_queue_capacity() // 4)
+
     def replace_streams(self, stream_keys: set[StreamKey]) -> bool:
         next_by_exchange: dict[str, set[str]] = {}
         for exchange, outcome_id in stream_keys:
@@ -2295,9 +2320,17 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
             if not quote_updates:
                 continue
 
-            for quote_update in quote_updates:
-                if quote_update.outcome_id not in desired_outcome_ids:
-                    continue
+            coalesced_quote_updates = self._coalesce_polymarket_quote_updates(
+                quote_updates,
+                desired_outcome_ids=desired_outcome_ids,
+            )
+            if len(coalesced_quote_updates) < len(quote_updates):
+                self._debug(
+                    "multiplex direct ws coalesced exchange=polymarket "
+                    f"raw={len(quote_updates)} kept={len(coalesced_quote_updates)}"
+                )
+
+            for quote_update in coalesced_quote_updates:
                 self._enqueue_multiplex_quote(
                     ingestor=ingestor,
                     exchange=exchange,
@@ -2312,6 +2345,30 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
 
         self._close_exchange_client(exchange)
         self._debug("multiplex direct ws loop exiting exchange=polymarket")
+
+    def _coalesce_polymarket_quote_updates(
+        self,
+        quote_updates: list[Any],
+        *,
+        desired_outcome_ids: set[str],
+    ) -> list[Any]:
+        if len(quote_updates) <= 1:
+            return [
+                quote_update
+                for quote_update in quote_updates
+                if quote_update.outcome_id in desired_outcome_ids
+            ]
+
+        coalesced_reversed: list[Any] = []
+        seen_outcome_ids: set[str] = set()
+        for quote_update in reversed(quote_updates):
+            outcome_id = quote_update.outcome_id
+            if outcome_id not in desired_outcome_ids or outcome_id in seen_outcome_ids:
+                continue
+            seen_outcome_ids.add(outcome_id)
+            coalesced_reversed.append(quote_update)
+        coalesced_reversed.reverse()
+        return coalesced_reversed
 
     def direct_quiet_refresh_loop(self, ingestor: MultiplexExchangeIngestor) -> None:
         exchange = ingestor.exchange
@@ -2346,6 +2403,15 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
 
         refresh_after_seconds = self.polymarket_direct_quiet_refresh_seconds()
         refresh_batch_size = self.polymarket_direct_quiet_refresh_batch_size()
+        queue_depth_limit = self.polymarket_direct_quiet_refresh_queue_depth_limit(ingestor)
+        current_queue_depth = ingestor.dispatch_queue_depth()
+        if current_queue_depth >= queue_depth_limit:
+            self._debug(
+                "multiplex direct quiet refresh skipped exchange=polymarket "
+                f"reason=dispatch_queue_pressure depth={current_queue_depth} "
+                f"limit={queue_depth_limit}"
+            )
+            return
         refresh_candidates: list[tuple[int, float, str]] = []
         with self._state_lock:
             last_ok = dict(self._stream_last_watch_ok_at)
@@ -2382,6 +2448,14 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
 
         refreshed_count = 0
         for outcome_id in selected_outcome_ids:
+            current_queue_depth = ingestor.dispatch_queue_depth()
+            if current_queue_depth >= queue_depth_limit:
+                self._debug(
+                    "multiplex direct quiet refresh paused exchange=polymarket "
+                    f"reason=dispatch_queue_pressure depth={current_queue_depth} "
+                    f"limit={queue_depth_limit}"
+                )
+                break
             try:
                 fetch_started_at = time.time()
                 book = self._fetch_order_book(
@@ -2394,6 +2468,14 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
                 if book_timestamp_ms is not None:
                     source_latency_ms = (time.time() * 1000.0) - float(book_timestamp_ms)
                 best_bid, best_ask = extract_best_prices(book)
+                current_queue_depth = ingestor.dispatch_queue_depth()
+                if current_queue_depth >= queue_depth_limit:
+                    self._debug(
+                        "multiplex direct quiet refresh deferred exchange=polymarket "
+                        f"outcome_id={outcome_id} depth={current_queue_depth} "
+                        f"limit={queue_depth_limit}"
+                    )
+                    continue
                 self._enqueue_multiplex_quote(
                     ingestor=ingestor,
                     exchange=exchange,

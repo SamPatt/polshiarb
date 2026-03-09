@@ -16,7 +16,7 @@ from app.streaming.manager import (
     MultiplexSubscriptionManager,
     QueuedQuoteUpdate,
 )
-from app.streaming.polymarket_ws import parse_polymarket_ws_quote_updates
+from app.streaming.polymarket_ws import PolymarketQuoteUpdate, parse_polymarket_ws_quote_updates
 from app.streaming.store import QuoteStore
 
 
@@ -818,6 +818,81 @@ def test_multiplex_polymarket_direct_ws_runs_quiet_refresh_only_on_idle(monkeypa
     assert any("multiplex direct ws loop exiting exchange=polymarket" in line for line in lines)
 
 
+def test_multiplex_polymarket_direct_ws_coalesces_duplicate_outcomes(monkeypatch) -> None:
+    lines: list[str] = []
+    stop_event = threading.Event()
+
+    class FakeWsClient:
+        def sync_subscriptions(self, outcome_ids):  # noqa: ANN001
+            assert outcome_ids == {"PM-YES"}
+            return set(), set()
+
+        def recv_quote_updates(self):  # noqa: ANN001
+            stop_event.set()
+            return [
+                PolymarketQuoteUpdate(
+                    outcome_id="PM-YES",
+                    best_bid=0.41,
+                    best_ask=0.43,
+                    book_timestamp_ms=1000,
+                    received_at=10.0,
+                    source_latency_ms=15.0,
+                    source_label="direct_ws_price_change",
+                ),
+                PolymarketQuoteUpdate(
+                    outcome_id="PM-YES",
+                    best_bid=0.44,
+                    best_ask=0.46,
+                    book_timestamp_ms=1005,
+                    received_at=11.0,
+                    source_latency_ms=12.0,
+                    source_label="direct_ws_price_change",
+                ),
+            ]
+
+    manager = MultiplexSubscriptionManager(
+        args=argparse.Namespace(
+            api_base_url="http://127.0.0.1:8011",
+            arb_threshold=0.02,
+            deviation_threshold=0.03,
+            cooldown_seconds=60.0,
+            mapping_refresh_seconds=3600.0,
+            book_stale_seconds=15.0,
+            depth=None,
+            include_expired=False,
+            include_inactive=False,
+            engine="multiplex",
+            debug=True,
+            multiplex_polymarket_source_mode="direct",
+        ),
+        quote_store=QuoteStore(),
+        stop_event=stop_event,
+        print_line=lambda line: lines.append(line),
+        debug=lambda line: lines.append(f"[debug] {line}"),
+        exchange_builder=lambda exchange, **kwargs: object(),
+        on_quote_update=lambda _stream_key: None,
+    )
+    ingestor = MultiplexExchangeIngestor(manager=manager, exchange="polymarket")
+    ingestor.replace_subscriptions({"PM-YES"})
+    manager._exchange_ingestors["polymarket"] = ingestor  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(manager, "_get_polymarket_ws_client", lambda: FakeWsClient())
+    monkeypatch.setattr(manager, "_close_exchange_client", lambda exchange: None)
+
+    manager._run_polymarket_direct_loop(ingestor)
+
+    assert ingestor.dispatch_queue_depth() == 1
+    queued_update = ingestor.next_quote_update()
+    assert queued_update is not None
+    assert queued_update.quote.best_bid == 0.44
+    assert queued_update.quote.best_ask == 0.46
+    assert queued_update.quote.source_label == "direct_ws_price_change"
+    assert any(
+        "multiplex direct ws coalesced exchange=polymarket raw=2 kept=1" in line
+        for line in lines
+    )
+
+
 def test_multiplex_polymarket_direct_quiet_refresh_fetches_stale_books() -> None:
     lines: list[str] = []
 
@@ -875,6 +950,75 @@ def test_multiplex_polymarket_direct_quiet_refresh_fetches_stale_books() -> None
     assert quote_update.quote.source_label == "quiet_refresh"
     assert any(
         "multiplex direct quiet refresh exchange=polymarket outcomes=PM-STALE count=1"
+        in line
+        for line in lines
+    )
+
+
+def test_multiplex_polymarket_direct_quiet_refresh_skips_under_queue_pressure() -> None:
+    lines: list[str] = []
+
+    class FakeExchange:
+        def fetch_order_book(self, outcome_id):  # noqa: ANN001
+            raise AssertionError("quiet refresh should not fetch while queue is pressured")
+
+        def close(self) -> None:
+            return None
+
+    manager = MultiplexSubscriptionManager(
+        args=argparse.Namespace(
+            api_base_url="http://127.0.0.1:8011",
+            arb_threshold=0.02,
+            deviation_threshold=0.03,
+            cooldown_seconds=60.0,
+            mapping_refresh_seconds=3600.0,
+            book_stale_seconds=15.0,
+            depth=None,
+            include_expired=False,
+            include_inactive=False,
+            engine="multiplex",
+            debug=True,
+            multiplex_dispatch_queue_size=4,
+            multiplex_polymarket_source_mode="direct",
+            multiplex_polymarket_direct_quiet_refresh_seconds=1.0,
+        ),
+        quote_store=QuoteStore(),
+        stop_event=threading.Event(),
+        print_line=lambda line: lines.append(line),
+        debug=lambda line: lines.append(f"[debug] {line}"),
+        exchange_builder=lambda exchange, **kwargs: FakeExchange(),
+        on_quote_update=lambda _stream_key: None,
+    )
+    ingestor = MultiplexExchangeIngestor(manager=manager, exchange="polymarket")
+    ingestor.replace_subscriptions({"PM-STALE"})
+    manager._exchange_ingestors["polymarket"] = ingestor  # type: ignore[attr-defined]
+
+    for idx in range(2):
+        ingestor.enqueue_quote_update(
+            QueuedQuoteUpdate(
+                quote=QuoteSnapshot(
+                    exchange="polymarket",
+                    outcome_id=f"PM-{idx}",
+                    best_bid=0.40,
+                    best_ask=0.50,
+                    book_timestamp_ms=None,
+                    updated_at=100.0 + idx,
+                    source_label="direct_ws_price_change",
+                ),
+                watch_latency_ms=5.0,
+                received_at=200.0 + idx,
+            )
+        )
+
+    now = time.time()
+    with manager._state_lock:
+        manager._stream_last_watch_ok_at[("polymarket", "PM-STALE")] = now - 5.0
+
+    manager._refresh_polymarket_direct_quiet_books(ingestor=ingestor, now=now)
+
+    assert ingestor.dispatch_queue_depth() == 2
+    assert any(
+        "multiplex direct quiet refresh skipped exchange=polymarket reason=dispatch_queue_pressure"
         in line
         for line in lines
     )
@@ -2658,6 +2802,68 @@ def test_multiplex_dispatch_queue_is_bounded_and_drops_oldest() -> None:
     }
     assert snapshot["quotes"][("polymarket", "PM-1")].best_ask == 0.51
     assert snapshot["quotes"][("polymarket", "PM-2")].best_ask == 0.52
+
+
+def test_multiplex_dispatch_queue_prefers_dropping_quiet_refresh() -> None:
+    stop_event = threading.Event()
+    manager = MultiplexSubscriptionManager(
+        args=argparse.Namespace(
+            api_base_url="http://127.0.0.1:8011",
+            arb_threshold=0.02,
+            deviation_threshold=0.03,
+            cooldown_seconds=60.0,
+            mapping_refresh_seconds=3600.0,
+            book_stale_seconds=15.0,
+            depth=None,
+            include_expired=False,
+            include_inactive=False,
+            engine="multiplex",
+            debug=True,
+            multiplex_dispatch_queue_size=2,
+        ),
+        quote_store=QuoteStore(),
+        stop_event=stop_event,
+        print_line=lambda line: None,
+        debug=lambda line: None,
+        exchange_builder=lambda exchange, **kwargs: object(),
+        on_quote_update=lambda _stream_key: None,
+    )
+    ingestor = MultiplexExchangeIngestor(manager=manager, exchange="polymarket")
+    manager._exchange_ingestors["polymarket"] = ingestor  # type: ignore[attr-defined]
+
+    for outcome_id, source_label, best_ask in [
+        ("PM-QUIET", "quiet_refresh", 0.50),
+        ("PM-LIVE-1", "direct_ws_price_change", 0.51),
+        ("PM-LIVE-2", "direct_ws_price_change", 0.52),
+    ]:
+        ingestor.enqueue_quote_update(
+            QueuedQuoteUpdate(
+                quote=QuoteSnapshot(
+                    exchange="polymarket",
+                    outcome_id=outcome_id,
+                    best_bid=0.40,
+                    best_ask=best_ask,
+                    book_timestamp_ms=None,
+                    updated_at=100.0,
+                    source_label=source_label,
+                ),
+                watch_latency_ms=5.0,
+                received_at=200.0,
+            )
+        )
+
+    health = manager.health_state(now=time.time())
+    assert health.exchange_queue_depth_counts["polymarket"] == 2
+    assert health.exchange_dispatch_drop_counts["polymarket"] == 1
+
+    stop_event.set()
+    manager.dispatch_loop(ingestor)
+
+    snapshot = manager._quote_store.snapshot()  # type: ignore[attr-defined]
+    assert snapshot["quotes"].keys() == {
+        ("polymarket", "PM-LIVE-1"),
+        ("polymarket", "PM-LIVE-2"),
+    }
 
 
 def test_debug_heartbeat_includes_exchange_modes(monkeypatch) -> None:
