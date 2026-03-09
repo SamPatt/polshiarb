@@ -2101,6 +2101,7 @@ def test_multiplex_kalshi_worker_recovery_restores_watch_after_all_workers_block
             multiplex_backoff_jitter_ratio=0.0,
             multiplex_mode_hysteresis_seconds=0.0,
             multiplex_kalshi_worker_count=2,
+            multiplex_kalshi_all_workers_blocked_degrade_seconds=0.0,
             multiplex_kalshi_successes_to_restore_watch=2,
         ),
         quote_store=QuoteStore(),
@@ -2149,6 +2150,62 @@ def test_multiplex_kalshi_worker_recovery_restores_watch_after_all_workers_block
     )
     assert any(
         "exchange_source_mode exchange=kalshi mode=watch reason=stream_ok"
+        in line
+        for line in lines
+    )
+
+
+def test_multiplex_kalshi_all_workers_blocked_waits_before_degrading_source_mode() -> None:
+    lines: list[str] = []
+    stop_event = threading.Event()
+    stop_event.set()
+    manager = MultiplexSubscriptionManager(
+        args=argparse.Namespace(
+            api_base_url="http://127.0.0.1:8011",
+            arb_threshold=0.02,
+            deviation_threshold=0.03,
+            cooldown_seconds=60.0,
+            mapping_refresh_seconds=3600.0,
+            book_stale_seconds=15.0,
+            depth=None,
+            include_expired=False,
+            include_inactive=False,
+            engine="multiplex",
+            debug=True,
+            kalshi_book_mode="auto",
+            multiplex_backoff_jitter_ratio=0.0,
+            multiplex_mode_hysteresis_seconds=0.0,
+            multiplex_kalshi_worker_count=2,
+            multiplex_kalshi_all_workers_blocked_degrade_seconds=60.0,
+        ),
+        quote_store=QuoteStore(),
+        stop_event=stop_event,
+        print_line=lambda line: lines.append(line),
+        debug=lambda line: lines.append(f"[debug] {line}"),
+        exchange_builder=lambda exchange, **kwargs: object(),
+        on_quote_update=lambda _stream_key: None,
+    )
+
+    manager.replace_streams({("kalshi", "KX-1")})
+    manager._register_rate_limit(
+        exchange="kalshi",
+        outcome_id="KX-1",
+        exc=RuntimeError("429 too many requests"),
+        worker_index=0,
+    )
+    manager._register_rate_limit(
+        exchange="kalshi",
+        outcome_id="KX-1",
+        exc=RuntimeError("429 too many requests"),
+        worker_index=1,
+    )
+
+    health = manager.health_state(now=time.time())
+    assert health.exchange_source_modes["kalshi"] == "watch"
+    assert health.exchange_modes["kalshi"] == "recovering"
+    assert health.rate_limit_counts["kalshi"] == 2
+    assert not any(
+        "exchange_source_mode exchange=kalshi mode=degraded reason=rate_limit outcome_id=KX-1"
         in line
         for line in lines
     )

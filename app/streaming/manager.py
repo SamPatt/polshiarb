@@ -668,6 +668,7 @@ class LegacySubscriptionManager:
         self._exchange_recovery_reason: dict[str, str] = {}
         self._exchange_consecutive_failure_count: dict[str, int] = {}
         self._exchange_success_streak_count: dict[str, int] = {}
+        self._exchange_all_workers_blocked_since: dict[str, float] = {}
         self._worker_exchange_retry_not_before: dict[tuple[str, int], float] = {}
         self._worker_exchange_backoff_seconds: dict[tuple[str, int], float] = {}
         self._worker_exchange_rate_limit_count: dict[tuple[str, int], int] = {}
@@ -1225,6 +1226,18 @@ class LegacySubscriptionManager:
             if worker_exchange == exchange and count > 0
         )
 
+    def _kalshi_all_workers_blocked_degrade_seconds(self) -> float:
+        return max(
+            0.0,
+            float(
+                getattr(
+                    self.args,
+                    "multiplex_kalshi_all_workers_blocked_degrade_seconds",
+                    5.0,
+                )
+            ),
+        )
+
     def _is_sidecar_unavailable_error(self, exc: Exception) -> bool:
         message = str(exc).lower()
         return (
@@ -1276,6 +1289,13 @@ class LegacySubscriptionManager:
                 all_workers_blocked = (
                     self._exchange_rate_limit_count[exchange] >= self.producer_thread_count(exchange)
                 )
+                blocked_since = self._exchange_all_workers_blocked_since.get(exchange)
+                if all_workers_blocked:
+                    if blocked_since is None:
+                        blocked_since = now
+                        self._exchange_all_workers_blocked_since[exchange] = blocked_since
+                else:
+                    self._exchange_all_workers_blocked_since.pop(exchange, None)
                 recovery_reason = (
                     "rate_limit_storm_backoff" if is_storm else "rate_limit_backoff"
                 )
@@ -1292,7 +1312,13 @@ class LegacySubscriptionManager:
                 if should_log_storm:
                     self._next_rate_limit_storm_log_at[exchange] = now + 10.0
 
+            should_degrade_source = False
             if all_workers_blocked:
+                assert blocked_since is not None
+                should_degrade_source = (
+                    (now - blocked_since) >= self._kalshi_all_workers_blocked_degrade_seconds()
+                )
+            if should_degrade_source:
                 self._register_exchange_failure(
                     exchange=exchange,
                     reason="rate_limit_storm" if is_storm else "rate_limit",
@@ -1586,6 +1612,8 @@ class LegacySubscriptionManager:
                 self._worker_exchange_success_streak_count[worker_key] = 0
                 active_rate_limited_workers = self._active_worker_rate_limit_count_locked(exchange)
                 self._exchange_rate_limit_count[exchange] = active_rate_limited_workers
+                if active_rate_limited_workers < self.producer_thread_count(exchange):
+                    self._exchange_all_workers_blocked_since.pop(exchange, None)
                 if active_rate_limited_workers <= 0:
                     self._exchange_retry_not_before[exchange] = 0.0
                     self._exchange_consecutive_failure_count[exchange] = 0
@@ -2064,6 +2092,7 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
                 self._exchange_source_mode.pop(exchange, None)
                 self._exchange_source_mode_hold_until.pop(exchange, None)
                 self._exchange_source_preference.pop(exchange, None)
+                self._exchange_all_workers_blocked_since.pop(exchange, None)
             self._debug(
                 f"multiplex subscriptions updated exchange={exchange} add=0 remove={len(current_by_exchange[exchange])} keep=0 total=0"
             )
