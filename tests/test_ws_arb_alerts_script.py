@@ -2031,6 +2031,129 @@ def test_multiplex_kalshi_watch_auto_falls_back_to_poll_on_rate_limit() -> None:
         manager.stop(reason="test", timeout_seconds=1.0)
 
 
+def test_multiplex_kalshi_single_worker_rate_limit_keeps_watch_mode() -> None:
+    lines: list[str] = []
+    stop_event = threading.Event()
+    stop_event.set()
+    manager = MultiplexSubscriptionManager(
+        args=argparse.Namespace(
+            api_base_url="http://127.0.0.1:8011",
+            arb_threshold=0.02,
+            deviation_threshold=0.03,
+            cooldown_seconds=60.0,
+            mapping_refresh_seconds=3600.0,
+            book_stale_seconds=15.0,
+            depth=None,
+            include_expired=False,
+            include_inactive=False,
+            engine="multiplex",
+            debug=True,
+            kalshi_book_mode="auto",
+            multiplex_backoff_jitter_ratio=0.0,
+            multiplex_mode_hysteresis_seconds=0.0,
+            multiplex_kalshi_worker_count=2,
+        ),
+        quote_store=QuoteStore(),
+        stop_event=stop_event,
+        print_line=lambda line: lines.append(line),
+        debug=lambda line: lines.append(f"[debug] {line}"),
+        exchange_builder=lambda exchange, **kwargs: object(),
+        on_quote_update=lambda _stream_key: None,
+    )
+
+    manager.replace_streams({("kalshi", "KX-1")})
+    manager._register_rate_limit(
+        exchange="kalshi",
+        outcome_id="KX-1",
+        exc=RuntimeError("429 too many requests"),
+        worker_index=0,
+    )
+
+    health = manager.health_state(now=time.time())
+    assert health.exchange_source_modes["kalshi"] == "watch"
+    assert health.exchange_modes["kalshi"] == "recovering"
+    assert health.rate_limit_counts["kalshi"] == 1
+    assert any("exchange_mode exchange=kalshi mode=recovering reason=rate_limit" in line for line in lines)
+    assert not any(
+        "exchange_source_mode exchange=kalshi mode=degraded reason=rate_limit" in line
+        for line in lines
+    )
+
+
+def test_multiplex_kalshi_worker_recovery_restores_watch_after_all_workers_blocked() -> None:
+    lines: list[str] = []
+    stop_event = threading.Event()
+    stop_event.set()
+    manager = MultiplexSubscriptionManager(
+        args=argparse.Namespace(
+            api_base_url="http://127.0.0.1:8011",
+            arb_threshold=0.02,
+            deviation_threshold=0.03,
+            cooldown_seconds=60.0,
+            mapping_refresh_seconds=3600.0,
+            book_stale_seconds=15.0,
+            depth=None,
+            include_expired=False,
+            include_inactive=False,
+            engine="multiplex",
+            debug=True,
+            kalshi_book_mode="auto",
+            multiplex_backoff_jitter_ratio=0.0,
+            multiplex_mode_hysteresis_seconds=0.0,
+            multiplex_kalshi_worker_count=2,
+            multiplex_kalshi_successes_to_restore_watch=2,
+        ),
+        quote_store=QuoteStore(),
+        stop_event=stop_event,
+        print_line=lambda line: lines.append(line),
+        debug=lambda line: lines.append(f"[debug] {line}"),
+        exchange_builder=lambda exchange, **kwargs: object(),
+        on_quote_update=lambda _stream_key: None,
+    )
+
+    manager.replace_streams({("kalshi", "KX-1")})
+    manager._register_rate_limit(
+        exchange="kalshi",
+        outcome_id="KX-1",
+        exc=RuntimeError("429 too many requests"),
+        worker_index=0,
+    )
+    manager._register_rate_limit(
+        exchange="kalshi",
+        outcome_id="KX-1",
+        exc=RuntimeError("429 too many requests"),
+        worker_index=1,
+    )
+    with manager._state_lock:
+        manager._worker_exchange_retry_not_before[("kalshi", 0)] = time.time() - 1.0
+        manager._worker_exchange_retry_not_before[("kalshi", 1)] = time.time() + 60.0
+
+    health = manager.health_state(now=time.time())
+    assert health.exchange_source_modes["kalshi"] == "degraded"
+
+    manager._mark_stream_success("kalshi", worker_index=0)
+    health = manager.health_state(now=time.time())
+    assert health.exchange_source_modes["kalshi"] == "degraded"
+    assert health.exchange_modes["kalshi"] == "recovering"
+    assert health.rate_limit_counts["kalshi"] == 2
+
+    manager._mark_stream_success("kalshi", worker_index=0)
+    health = manager.health_state(now=time.time())
+    assert health.exchange_source_modes["kalshi"] == "watch"
+    assert health.exchange_modes["kalshi"] == "recovering"
+    assert health.rate_limit_counts["kalshi"] == 1
+    assert any(
+        "exchange_source_mode exchange=kalshi mode=degraded reason=rate_limit outcome_id=KX-1"
+        in line
+        for line in lines
+    )
+    assert any(
+        "exchange_source_mode exchange=kalshi mode=watch reason=stream_ok"
+        in line
+        for line in lines
+    )
+
+
 def test_multiplex_kalshi_source_mode_hysteresis_delays_return_to_watch() -> None:
     lines: list[str] = []
     stop_event = threading.Event()

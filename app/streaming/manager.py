@@ -44,6 +44,7 @@ class QueuedQuoteUpdate:
     quote: QuoteSnapshot
     watch_latency_ms: float
     received_at: float
+    worker_index: int | None = None
 
 
 class RollingLatencyTracker:
@@ -667,6 +668,10 @@ class LegacySubscriptionManager:
         self._exchange_recovery_reason: dict[str, str] = {}
         self._exchange_consecutive_failure_count: dict[str, int] = {}
         self._exchange_success_streak_count: dict[str, int] = {}
+        self._worker_exchange_retry_not_before: dict[tuple[str, int], float] = {}
+        self._worker_exchange_backoff_seconds: dict[tuple[str, int], float] = {}
+        self._worker_exchange_rate_limit_count: dict[tuple[str, int], int] = {}
+        self._worker_exchange_success_streak_count: dict[tuple[str, int], int] = {}
         self._next_rate_limit_log_at: dict[StreamKey, float] = {}
         self._next_rate_limit_storm_log_at: dict[str, float] = {}
         self._exchange_clients: dict[str, Any] = {}
@@ -769,6 +774,28 @@ class LegacySubscriptionManager:
             error_counts = dict(self._stream_watch_error_count)
             latencies = dict(self._stream_last_watch_latency_ms)
             last_ok = dict(self._stream_last_watch_ok_at)
+            worker_retry_not_before = dict(self._worker_exchange_retry_not_before)
+            worker_backoffs = dict(self._worker_exchange_backoff_seconds)
+            worker_rate_limits = dict(self._worker_exchange_rate_limit_count)
+
+        for (exchange, _worker_index), retry_not_before in worker_retry_not_before.items():
+            retry_windows.setdefault(exchange, 0.0)
+            if retry_not_before > now:
+                retry_windows[exchange] = max(retry_windows[exchange], retry_not_before - now)
+        for (exchange, _worker_index), backoff_seconds in worker_backoffs.items():
+            if exchange not in backoffs:
+                backoffs[exchange] = 0.0
+            if worker_rate_limits.get((exchange, _worker_index), 0) > 0:
+                backoffs[exchange] = max(backoffs[exchange], backoff_seconds)
+        worker_local_exchanges = {
+            exchange
+            for exchange, _worker_index in worker_rate_limits
+        }
+        for exchange in worker_local_exchanges:
+            rate_limit_counts[exchange] = 0
+        for (exchange, _worker_index), count in worker_rate_limits.items():
+            if count > 0:
+                rate_limit_counts[exchange] = rate_limit_counts.get(exchange, 0) + 1
 
         with self._client_lock:
             client_exchanges = sorted(
@@ -954,11 +981,22 @@ class LegacySubscriptionManager:
         self,
         *,
         exchange: str,
-        ingestor: LegacyExchangeIngestor,
+        ingestor: LegacyExchangeIngestor | MultiplexExchangeIngestor,
+        worker_index: int | None = None,
     ) -> None:
         while not ingestor.should_stop():
             with self._state_lock:
-                retry_not_before = self._exchange_retry_not_before.get(exchange, 0.0)
+                if self._uses_worker_local_rate_limit_state(
+                    exchange=exchange,
+                    worker_index=worker_index,
+                ):
+                    assert worker_index is not None
+                    retry_not_before = self._worker_exchange_retry_not_before.get(
+                        (exchange, worker_index),
+                        0.0,
+                    )
+                else:
+                    retry_not_before = self._exchange_retry_not_before.get(exchange, 0.0)
             now = time.time()
             if retry_not_before <= now:
                 return
@@ -1167,6 +1205,26 @@ class LegacySubscriptionManager:
     def _is_rate_limited_error(self, exc: Exception) -> bool:
         return "429" in str(exc)
 
+    def _uses_worker_local_rate_limit_state(
+        self,
+        *,
+        exchange: str,
+        worker_index: int | None,
+    ) -> bool:
+        return (
+            worker_index is not None
+            and worker_index >= 0
+            and exchange == "kalshi"
+            and self._is_multiplex_engine()
+        )
+
+    def _active_worker_rate_limit_count_locked(self, exchange: str) -> int:
+        return sum(
+            1
+            for (worker_exchange, _worker_index), count in self._worker_exchange_rate_limit_count.items()
+            if worker_exchange == exchange and count > 0
+        )
+
     def _is_sidecar_unavailable_error(self, exc: Exception) -> bool:
         message = str(exc).lower()
         return (
@@ -1184,7 +1242,99 @@ class LegacySubscriptionManager:
         message = str(exc).lower()
         return "failed to fetch order book" in message and "order not found" in message
 
-    def _register_rate_limit(self, *, exchange: str, outcome_id: str, exc: Exception) -> None:
+    def _register_rate_limit(
+        self,
+        *,
+        exchange: str,
+        outcome_id: str,
+        exc: Exception,
+        worker_index: int | None = None,
+    ) -> None:
+        if self._uses_worker_local_rate_limit_state(exchange=exchange, worker_index=worker_index):
+            assert worker_index is not None
+            now = time.time()
+            worker_key = (exchange, worker_index)
+            with self._state_lock:
+                next_count = self._worker_exchange_rate_limit_count.get(worker_key, 0) + 1
+                self._worker_exchange_rate_limit_count[worker_key] = next_count
+                self._worker_exchange_success_streak_count[worker_key] = 0
+                is_storm = next_count >= self._rate_limit_storm_threshold()
+                previous_backoff = self._worker_exchange_backoff_seconds.get(worker_key, 1.0)
+                next_backoff = min(max(previous_backoff * 2.0, 2.0), 60.0)
+                self._worker_exchange_backoff_seconds[worker_key] = next_backoff
+                retry_delay = self._jitter_backoff_seconds(next_backoff)
+                if is_storm:
+                    retry_delay = max(retry_delay, self._rate_limit_storm_min_delay_seconds())
+                retry_not_before = max(
+                    self._worker_exchange_retry_not_before.get(worker_key, 0.0),
+                    now + retry_delay,
+                )
+                self._worker_exchange_retry_not_before[worker_key] = retry_not_before
+                self._exchange_rate_limit_count[exchange] = self._active_worker_rate_limit_count_locked(
+                    exchange
+                )
+                all_workers_blocked = (
+                    self._exchange_rate_limit_count[exchange] >= self.producer_thread_count(exchange)
+                )
+                recovery_reason = (
+                    "rate_limit_storm_backoff" if is_storm else "rate_limit_backoff"
+                )
+                self._exchange_recovery_reason[exchange] = recovery_reason
+
+                log_key = (exchange, outcome_id)
+                should_log = now >= self._next_rate_limit_log_at.get(log_key, 0.0)
+                if should_log:
+                    self._next_rate_limit_log_at[log_key] = now + 10.0
+                should_log_storm = is_storm and now >= self._next_rate_limit_storm_log_at.get(
+                    exchange,
+                    0.0,
+                )
+                if should_log_storm:
+                    self._next_rate_limit_storm_log_at[exchange] = now + 10.0
+
+            if all_workers_blocked:
+                self._register_exchange_failure(
+                    exchange=exchange,
+                    reason="rate_limit_storm" if is_storm else "rate_limit",
+                    outcome_id=outcome_id,
+                    recovery_reason=recovery_reason,
+                )
+            else:
+                self._set_exchange_mode(
+                    exchange=exchange,
+                    mode="recovering",
+                    reason="rate_limit_storm" if is_storm else "rate_limit",
+                    outcome_id=outcome_id,
+                )
+                self._emit_recovery_policy(
+                    exchange=exchange,
+                    policy=recovery_reason,
+                    mode="recovering",
+                    outcome_id=outcome_id,
+                )
+
+            if should_log:
+                delay = max(0.0, retry_not_before - now)
+                self._print_line(
+                    f"[warn] rate limit exchange={exchange} outcome_id={outcome_id} "
+                    f"worker_index={worker_index} retry_in={delay:.1f}s "
+                    f"backoff={next_backoff:.1f}s error={exc}"
+                )
+                self._debug(
+                    f"rate-limit-detail exchange={exchange} outcome_id={outcome_id} "
+                    f"worker_index={worker_index} error_type={type(exc).__name__} "
+                    f"retry_not_before={retry_not_before:.3f}"
+                )
+            if should_log_storm:
+                delay = max(0.0, retry_not_before - now)
+                self._print_line(
+                    f"[warn] exchange_rate_limit_storm exchange={exchange} "
+                    f"outcome_id={outcome_id} worker_index={worker_index} "
+                    f"count={next_count} retry_in={delay:.1f}s"
+                )
+            self._maybe_enable_kalshi_polling_after_rate_limit(exchange=exchange)
+            return
+
         now = time.time()
         with self._state_lock:
             next_count = self._exchange_rate_limit_count.get(exchange, 0) + 1
@@ -1384,9 +1534,76 @@ class LegacySubscriptionManager:
                 f"[warn] pmxt sidecar restart failed reason={reason} exchange={exchange} error={exc}"
             )
 
-    def _mark_stream_success(self, exchange: str) -> None:
+    def _mark_stream_success(
+        self,
+        exchange: str,
+        *,
+        worker_index: int | None = None,
+    ) -> None:
         now = time.time()
         healthy_source_mode = self._healthy_exchange_source_mode(exchange)
+        if self._uses_worker_local_rate_limit_state(exchange=exchange, worker_index=worker_index):
+            assert worker_index is not None
+            worker_key = (exchange, worker_index)
+            with self._state_lock:
+                next_success_streak = self._worker_exchange_success_streak_count.get(worker_key, 0) + 1
+                self._worker_exchange_success_streak_count[worker_key] = next_success_streak
+                current_source_mode = self._exchange_source_mode.get(exchange)
+                worker_retry_not_before = self._worker_exchange_retry_not_before.get(
+                    worker_key,
+                    0.0,
+                )
+                worker_rate_limit_count = self._worker_exchange_rate_limit_count.get(worker_key, 0)
+                exchange_recovery_reason = self._exchange_recovery_reason.get(exchange)
+                should_clear_worker_failure = True
+                if (
+                    current_source_mode == "degraded"
+                    and (
+                        worker_rate_limit_count > 0
+                        or exchange_recovery_reason
+                        in {"rate_limit_backoff", "rate_limit_storm_backoff"}
+                    )
+                ):
+                    required_successes = max(
+                        1,
+                        int(
+                            getattr(
+                                self.args,
+                                "multiplex_kalshi_successes_to_restore_watch",
+                                3,
+                            )
+                        ),
+                    )
+                    should_clear_worker_failure = (
+                        worker_retry_not_before <= now and next_success_streak >= required_successes
+                    )
+                if not should_clear_worker_failure:
+                    return
+
+                self._worker_exchange_retry_not_before[worker_key] = 0.0
+                self._worker_exchange_backoff_seconds[worker_key] = 1.0
+                self._worker_exchange_rate_limit_count[worker_key] = 0
+                self._worker_exchange_success_streak_count[worker_key] = 0
+                active_rate_limited_workers = self._active_worker_rate_limit_count_locked(exchange)
+                self._exchange_rate_limit_count[exchange] = active_rate_limited_workers
+                if active_rate_limited_workers <= 0:
+                    self._exchange_retry_not_before[exchange] = 0.0
+                    self._exchange_consecutive_failure_count[exchange] = 0
+                    self._exchange_success_streak_count[exchange] = 0
+                    self._exchange_recovery_reason.pop(exchange, None)
+
+            self._set_exchange_source_mode(
+                exchange=exchange,
+                mode=healthy_source_mode,
+                reason="stream_ok",
+            )
+            self._set_exchange_mode(
+                exchange=exchange,
+                mode="healthy" if active_rate_limited_workers <= 0 else "recovering",
+                reason="stream_ok",
+            )
+            return
+
         should_clear_exchange_failure = True
         with self._state_lock:
             next_success_streak = self._exchange_success_streak_count.get(exchange, 0) + 1
@@ -1978,6 +2195,7 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
         received_at: float,
         source_latency_ms: float | None,
         source_label: str,
+        worker_index: int | None = None,
     ) -> None:
         quote = QuoteSnapshot(
             exchange=exchange,
@@ -1995,6 +2213,7 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
                 quote=quote,
                 watch_latency_ms=watch_latency_ms,
                 received_at=received_at,
+                worker_index=worker_index,
             )
         )
         if dropped_count > 0:
@@ -2258,6 +2477,7 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
                         exchange=exchange,
                         outcome_id=outcome_id,
                         exc=exc,
+                        worker_index=worker_index,
                     )
                     continue
                 if self._is_auth_token_error(exc):
@@ -2333,6 +2553,7 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
                 received_at=seen_at,
                 source_latency_ms=watch_latency_ms,
                 source_label=self._current_exchange_source_mode(exchange),
+                worker_index=worker_index,
             )
             time.sleep(self._loop_delay_seconds(exchange))
 
@@ -2361,7 +2582,10 @@ class MultiplexSubscriptionManager(LegacySubscriptionManager):
             ingestor.clear_forced_fetch_outcome_id(quote.outcome_id)
             stored_quote = replace(quote, updated_at=time.time())
             self._quote_store.upsert_quote(stored_quote)
-            self._mark_stream_success(exchange)
+            self._mark_stream_success(
+                exchange,
+                worker_index=quote_update.worker_index,
+            )
             self._on_quote_update(stream_key)
 
         self._debug(f"multiplex dispatch loop exiting exchange={exchange}")
